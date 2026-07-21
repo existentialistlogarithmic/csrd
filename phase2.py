@@ -7,7 +7,6 @@
 import argparse
 import json
 import logging
-import math
 import os
 import re
 from collections import Counter
@@ -40,7 +39,6 @@ PILLAR_COLORS = {
     "social":      "#1baf7a",
     "governance":  "#eda100",
 }
-
 # ordered years get an ordinal ramp (light = earlier), validated steps
 YEAR_RAMP = ["#86b6ef", "#2a78d6", "#184f95"]
 
@@ -107,100 +105,18 @@ def count_theme_hits(text: str, pillar: str) -> int:
     return len(_THEME_RE[pillar].findall(text))
 
 
-#_________________ ESRS topical-standard coverage
-# The real research question for CSRD reports is *which ESRS topical standards a
-# report substantively addresses*, not which generic words are frequent. Each
-# standard is detected by its ESRS code (E1, S1-2, G1 ...) plus its defining
-# concepts. `pillar` ties the standard to E / S / G for colouring & grouping.
-ESRS_STANDARDS = {
-    "E1 Climate change": ("environment", [
-        r"\bE1\b", r"\bE1-\d", r"climate change", r"greenhouse gas", r"\bghg\b",
-        r"scope [123]", r"transition plan", r"decarboni", r"net[- ]zero", r"carbon footprint"]),
-    "E2 Pollution": ("environment", [
-        r"\bE2\b", r"\bE2-\d", r"pollution", r"pollutant", r"microplastic",
-        r"substances of concern", r"air emissions"]),
-    "E3 Water & marine": ("environment", [
-        r"\bE3\b", r"\bE3-\d", r"water consumption", r"water withdrawal",
-        r"water discharge", r"marine resource"]),
-    "E4 Biodiversity": ("environment", [
-        r"\bE4\b", r"\bE4-\d", r"biodiversity", r"ecosystem", r"deforestation",
-        r"land[- ]use change", r"invasive species"]),
-    "E5 Circular economy": ("environment", [
-        r"\bE5\b", r"\bE5-\d", r"circular economy", r"resource use",
-        r"resource inflow", r"resource outflow", r"material efficiency"]),
-    "S1 Own workforce": ("social", [
-        r"\bS1\b", r"\bS1-\d", r"own workforce", r"collective bargaining",
-        r"gender pay gap", r"work[- ]life balance", r"occupational health"]),
-    "S2 Value-chain workers": ("social", [
-        r"\bS2\b", r"\bS2-\d", r"workers in the value chain",
-        r"value chain workers", r"supply chain (?:labour|labor|workers)"]),
-    "S3 Affected communities": ("social", [
-        r"\bS3\b", r"\bS3-\d", r"affected communities", r"indigenous peoples",
-        r"local communities"]),
-    "S4 Consumers & end-users": ("social", [
-        r"\bS4\b", r"\bS4-\d", r"consumers and end[- ]users", r"end[- ]users",
-        r"product safety", r"consumer health"]),
-    "G1 Business conduct": ("governance", [
-        r"\bG1\b", r"\bG1-\d", r"business conduct", r"anti[- ]corruption",
-        r"anti[- ]bribery", r"bribery", r"whistleblow", r"corporate culture",
-        r"political (?:engagement|contributions)", r"lobbying"]),
-}
-_ESRS_RE = {std: re.compile("|".join(pats), re.IGNORECASE)
-            for std, (pillar, pats) in ESRS_STANDARDS.items()}
-ESRS_PILLAR = {std: pillar for std, (pillar, _) in ESRS_STANDARDS.items()}
-
-# a standard counts as "covered" only above this many matches, so a single
-# passing reference in a contents list doesn't count as real coverage.
-ESRS_COVER_THRESHOLD = 5
-
-
-#_________________ CSRD / ESRS cross-cutting concepts (adoption = present at all)
-CSRD_CONCEPTS = {
-    "Double materiality":        r"double materiality|impact materiality|financial materiality",
-    "Materiality assessment":    r"materiality assessment|material (?:topics?|impacts?|matters?)",
-    "EU Taxonomy":               r"eu taxonomy|taxonomy[- ](?:aligned|eligible)",
-    "Scope 3 emissions":         r"scope 3",
-    "Transition plan":           r"transition plan",
-    "Science-based targets":     r"science[- ]based target|\bsbti\b",
-    "IROs":                      r"impacts,? risks and opportunities|\biros?\b",
-    "Value chain":               r"value chain",
-    "Due diligence":             r"due diligence",
-    "External assurance":        r"limited assurance|reasonable assurance",
-}
-_CONCEPT_RE = {c: re.compile(p, re.IGNORECASE) for c, p in CSRD_CONCEPTS.items()}
-
-
-def esrs_coverage(text: str) -> dict:
-    """Match count per ESRS topical standard."""
-    return {std: len(rx.findall(text)) for std, rx in _ESRS_RE.items()}
-
-
-def concept_flags(text: str) -> dict:
-    """True/False presence of each cross-cutting CSRD concept."""
-    return {c: bool(rx.search(text)) for c, rx in _CONCEPT_RE.items()}
-
-
 #_________________numeric metric regexes
-# a real figure = at least one digit, optional thousands/decimals, then a UNIT
-# of measure. GHG/CO2 on their own are categories, not units, so they are not
-# accepted here (they produced noise like "3 GHG"); "tCO2e" (tonnes CO2-eq) is.
-_NUM = r"\d[\d,]*(?:\.\d+)?"
 _METRIC_PATTERNS = [
-    # emissions & energy: "136,630.5 tCO2e", "952 GWh", "10.5 Mt CO2e"
-    rf"{_NUM}\s*(?:mt|kt|t)?\s?co2e?\b",
-    rf"{_NUM}\s*(?:tco2e?|ktco2e?|mtco2e?|tonnes?\s+co2e?)\b",
-    rf"{_NUM}\s*(?:twh|gwh|mwh|kwh|gj|tj|pj|mj)\b",
-    # percentages: "42.5%"  (optionally trailing context word)
-    rf"{_NUM}\s*%\s*(?:of|reduction|increase|renewable|female|women|recycl\w+)?",
-    # headcount: "3,200 employees" / "1,250 FTE"
-    rf"{_NUM}\s*(?:employees?|workers?|fte)\b",
-    # money: "€1.2m", "$500k", "EUR 3.4 billion"
-    rf"(?:€|\$|£|eur|usd|gbp)\s*{_NUM}\s*(?:m|bn|k|million|billion|thousand)?\b",
+    # e.g. "12,500 tCO2e"  or  "12.5 MWh"
+    r"[\d,\.]+\s*(?:tco2e?|t co2e?|co2e?|ghg|mwh|gwh|gj|tj|mj|kwh|tonnes?|mt|kt)",
+    # percentage with optional context word
+    r"[\d,\.]+\s*%\s*(?:of|reduction|increase|renewable|female|women|recycl\w+)?",
+    # headcount: "3,200 employees"
+    r"[\d,\.]+\s*(?:employees?|workers?|staff|fte)",
+    # monetary: "€ 1.2m"  or  "$500k"
+    r"(?:€|\$|eur|usd|gbp)\s*[\d,\.]+\s*(?:m|bn|k|million|billion|thousand)?",
 ]
 _METRIC_RE = [re.compile(p, re.IGNORECASE) for p in _METRIC_PATTERNS]
-
-def _clean_metric(s: str) -> str:
-    return re.sub(r"\s+", " ", s).strip(" .,").strip()
 
 
 #_________________ step 3
@@ -220,40 +136,6 @@ def tokenise(text: str) -> list:
 def top_keywords(text: str, n: int = TOP_N_KEYWORDS) -> list:
     """Return [(word, count)] for the n most frequent content words."""
     return Counter(tokenise(text)).most_common(n)
-
-
-def corpus_tfidf(doc_tfs, df_counter, exclude=None, top_n=25):
-    """
-    Rank corpus terms by TF-IDF instead of raw frequency.
-
-    Raw counts surface boilerplate that appears in every report ("management",
-    "business", "financial"). TF-IDF multiplies a term's total frequency by
-    log(N / document-frequency), so words that appear in *every* report get an
-    IDF near zero and drop out, leaving the terms that actually distinguish
-    reports from one another. `exclude` drops entity noise (company names /
-    tickers) that would otherwise top the list because a firm names itself a
-    lot. Returns [(term, score)] high-to-low.
-    """
-    n_docs = len(doc_tfs)
-    if n_docs == 0:
-        return []
-    exclude = exclude or set()
-    # ignore ultra-rare terms (company-specific noise): require a term to appear
-    # in a meaningful share of reports, and never in literally all of them.
-    min_df = max(3, int(n_docs * 0.08))
-    total_tf = Counter()
-    for tf in doc_tfs:
-        total_tf.update(tf)
-    scores = {}
-    for term, tf_sum in total_tf.items():
-        if term in exclude or len(term) < 4:
-            continue
-        dfq = df_counter.get(term, 0)
-        if dfq < min_df or dfq >= n_docs:      # too rare, or in literally every doc
-            continue
-        idf = math.log(n_docs / dfq)
-        scores[term] = math.log1p(tf_sum) * idf
-    return sorted(scores.items(), key=lambda kv: -kv[1])[:top_n]
 
 
 #_________________ step 4
@@ -276,12 +158,9 @@ def extract_metrics(text: str, max_hits: int = MAX_METRICS) -> list:
     seen, hits = set(), []
     for pattern in _METRIC_RE:
         for m in pattern.finditer(text):
-            snippet = _clean_metric(m.group(0))
-            # drop degenerate captures like a bare unit or a lone digit
-            if not re.search(r"\d", snippet) or len(snippet) < 3:
-                continue
-            if snippet.lower() not in seen:
-                seen.add(snippet.lower())
+            snippet = m.group(0).strip()
+            if snippet not in seen:
+                seen.add(snippet)
                 hits.append(snippet)
             if len(hits) >= max_hits:
                 return hits
@@ -290,33 +169,13 @@ def extract_metrics(text: str, max_hits: int = MAX_METRICS) -> list:
 
 #_________________ key
 
-# disclosure-index / table-dump noise: ESRS datapoint codes, EFRAG IDs, MDR tags
-_BOILERPLATE_RE = re.compile(
-    r"ESRS|EFRAG|MDR-|E1-\d|E[1-5]-\d|\bIRO-1\b|\bAR \d|datapoint", re.IGNORECASE)
-
-def _looks_like_prose(s: str) -> bool:
-    """True if the sentence reads like real prose, not a code/table fragment."""
-    words = s.split()
-    if len(words) < 6:
-        return False
-    if _BOILERPLATE_RE.search(s):
-        return False
-    # real prose is mostly letters; table dumps are full of digits/brackets/codes
-    alpha = sum(c.isalpha() or c.isspace() for c in s)
-    if alpha / max(len(s), 1) < 0.75:
-        return False
-    # need a few lowercase 'connective' words to look like a sentence
-    lc = [w for w in words if w.islower() and len(w) > 2]
-    return len(lc) >= 4
-
-
 def key_sentences(text: str, pillar: str, max_sents: int = 3) -> list:
-    """Return up to max_sents prose sentences with the most keyword hits for a pillar."""
+    """Return up to max_sents sentences with the most keyword hits for a pillar."""
     sents = re.split(r"(?<=[.!?])\s+", text)
     scored = []
     for s in sents:
-        s = re.sub(r"\s+", " ", s).strip()
-        if len(s) < 40 or not _looks_like_prose(s):
+        s = s.strip()
+        if len(s) < 30:
             continue
         hits = count_theme_hits(s, pillar)
         if hits > 0:
@@ -341,16 +200,11 @@ def process_file(txt_path: str, meta: dict):
 
     text   = clean_text(raw)
     themes = score_themes(text)
+    kws    = top_keywords(text)
     mets   = extract_metrics(text)
-    esrs   = esrs_coverage(text)
-    concepts = concept_flags(text)
-    tokens = tokenise(text)                     # for corpus TF-IDF (done in main)
-    tf     = Counter(tokens)
 
     pillars  = {p: themes[p] for p in THEMES}
     dominant = max(pillars, key=pillars.get) if any(pillars.values()) else "unknown"
-
-    covered = [std for std, n in esrs.items() if n >= ESRS_COVER_THRESHOLD]
 
     flat = {
         "company":         meta.get("company", ""),
@@ -362,35 +216,23 @@ def process_file(txt_path: str, meta: dict):
         "word_count":      len(text.split()),
         "dominant_pillar": dominant,
         **themes,
-        # ESRS topical-standard coverage
-        "esrs_standards_covered": len(covered),
-        "esrs_covered":           "; ".join(covered),
-        **{f"esrs::{std}": n for std, n in esrs.items()},
-        # CSRD cross-cutting concept flags
-        **{f"concept::{c}": int(v) for c, v in concepts.items()},
+        "top_keywords":    ", ".join(w for w, _ in kws[:10]),
         "metric_hits":     len(mets),
     }
 
     detail = {
         **flat,
-        "esrs_full":         esrs,
-        "concepts":          concepts,
+        "top_keywords_full": kws,
         "metrics":           mets,
         "env_sentences":     key_sentences(text, "environment"),
         "soc_sentences":     key_sentences(text, "social"),
         "gov_sentences":     key_sentences(text, "governance"),
     }
 
-    # token freqs are returned out-of-band so main() can build corpus TF-IDF
-    return flat, detail, tf
+    return flat, detail
 
 
 # _________________help
-
-def out_df_companies(rows):
-    """All company names seen this run (for entity-token exclusion in TF-IDF)."""
-    return [r.get("company", "") for r in rows]
-
 
 def _stem_from_meta(row: dict) -> str:
     """Reconstruct the filename stem that phase1 would have used."""
@@ -401,6 +243,7 @@ def _stem_from_meta(row: dict) -> str:
     if str(year).strip() not in ("", "nan"):
         stem += f"_{int(float(year))}"
     return stem
+
 
 # _________________charts
 
@@ -492,75 +335,24 @@ def chart_density_by_country(out_df, path, top_n=10):
     _save(fig, path)
 
 
-def chart_esrs_coverage(out_df, path):
-    """Average disclosure intensity per ESRS topical standard.
-
-    Coverage (presence) is near-universal because CSRD mandates every standard,
-    so that view is flat. Intensity — the mean number of matches per report —
-    shows where reporting actually goes deep (E1 Climate) vs stays thin
-    (S3 Affected communities)."""
-    n = len(out_df)
-    if n == 0:
-        return
-    stds = list(ESRS_STANDARDS)
-    intensity = [out_df[f"esrs::{s}"].mean() for s in stds]
-    order = sorted(range(len(stds)), key=lambda i: intensity[i])  # biggest on top
-    stds = [stds[i] for i in order]
-    intensity = [intensity[i] for i in order]
-    colors = [PILLAR_COLORS[ESRS_PILLAR[s]] for s in stds]
-
-    fig, ax = _new_axes(7.5, 0.42 * len(stds) + 1.7)
-    ax.xaxis.grid(True, color=GRIDLINE, linewidth=0.8)
-    bars = ax.barh(stds, intensity, height=0.62, color=colors)
-    ax.bar_label(bars, fmt="%.0f", padding=3, color=INK_SECONDARY, fontsize=8.5)
-    ax.set_title("ESRS disclosure intensity by topical standard",
-                 loc="left", color=INK, fontsize=12)
-    ax.set_xlabel(f"Avg keyword/code matches per report (n = {n})",
-                  color=INK_SECONDARY, fontsize=9)
-    _save(fig, path)
-
-
-def chart_concept_adoption(out_df, path):
-    """Share of reports mentioning each cross-cutting CSRD concept."""
-    n = len(out_df)
-    if n == 0:
-        return
-    concepts = list(CSRD_CONCEPTS)
-    pct = [out_df[f"concept::{c}"].mean() * 100 for c in concepts]
-    order = sorted(range(len(concepts)), key=lambda i: pct[i])
-    concepts = [concepts[i] for i in order]
-    pct = [pct[i] for i in order]
-
-    fig, ax = _new_axes(7.5, 0.42 * len(concepts) + 1.6)
-    ax.xaxis.grid(True, color=GRIDLINE, linewidth=0.8)
-    bars = ax.barh(concepts, pct, height=0.62, color=PILLAR_COLORS["governance"])
-    ax.bar_label(bars, fmt="%.0f%%", padding=3, color=INK_SECONDARY, fontsize=8.5)
-    ax.set_xlim(0, 100)
-    ax.xaxis.set_major_formatter(lambda x, _: f"{x:.0f}%")
-    ax.set_title("CSRD reporting concepts — adoption rate",
-                 loc="left", color=INK, fontsize=12)
-    ax.set_xlabel(f"Share of the {n} reports mentioning the concept",
-                  color=INK_SECONDARY, fontsize=9)
-    _save(fig, path)
-
-
-def chart_distinctive_terms(tfidf_ranked, path, top_n=15):
-    """Corpus-distinctive terms by TF-IDF (filters out ubiquitous filler)."""
-    common = tfidf_ranked[:top_n]
+def chart_top_keywords(corpus_counter, path, top_n=15):
+    """Most frequent content words across the whole corpus."""
+    common = corpus_counter.most_common(top_n)
     if not common:
         return
     words = [w for w, _ in common][::-1]
-    scores = [s for _, s in common][::-1]
+    counts = [c for _, c in common][::-1]
 
-    fig, ax = _new_axes(7, 0.36 * len(words) + 1.6)
+    fig, ax = _new_axes(7, 0.35 * len(words) + 1.6)
     ax.xaxis.grid(True, color=GRIDLINE, linewidth=0.8)
-    bars = ax.barh(words, scores, height=0.58, color=PILLAR_COLORS["social"])
-    ax.set_title("Most distinctive terms across the corpus (TF-IDF)",
+    bars = ax.barh(words, counts, height=0.55, color=PILLAR_COLORS["environment"])
+    ax.bar_label(bars, fmt="%d", padding=3, color=INK_SECONDARY, fontsize=8)
+    ax.set_title("Top keywords across all English reports",
                  loc="left", color=INK, fontsize=12)
-    ax.set_xlabel("TF-IDF weight — frequent, but not ubiquitous",
+    ax.set_xlabel("Occurrences (within per-report top keywords)",
                   color=INK_SECONDARY, fontsize=9)
-    ax.tick_params(axis="x", labelbottom=False)
     _save(fig, path)
+
 
 def chart_year_comparison(out_df, path):
     """Average ESG density per pillar, one bar group per report year."""
@@ -589,14 +381,14 @@ def chart_year_comparison(out_df, path):
               frameon=False, fontsize=9, labelcolor=INK_SECONDARY)
     _save(fig, path)
 
-def make_charts(out_df, tfidf_ranked, charts_dir):
+
+def make_charts(out_df, corpus_counter, charts_dir):
     os.makedirs(charts_dir, exist_ok=True)
     chart_dominant_pillar(out_df, os.path.join(charts_dir, "dominant_pillar.png"))
     chart_pillar_hits(out_df, os.path.join(charts_dir, "pillar_hits.png"))
     chart_density_by_country(out_df, os.path.join(charts_dir, "esg_mix_by_country.png"))
-    chart_esrs_coverage(out_df, os.path.join(charts_dir, "esrs_coverage.png"))
-    chart_concept_adoption(out_df, os.path.join(charts_dir, "csrd_concept_adoption.png"))
-    chart_distinctive_terms(tfidf_ranked, os.path.join(charts_dir, "distinctive_terms.png"))
+    chart_top_keywords(corpus_counter, os.path.join(charts_dir, "top_keywords.png"))
+    chart_year_comparison(out_df, os.path.join(charts_dir, "esg_by_year.png"))
 
 
 # _________________main
@@ -635,8 +427,7 @@ def main():
         log.info("Limiting to %d documents", args.limit)
 
     rows = []
-    doc_tfs = []          # per-document term frequencies, for corpus TF-IDF
-    df_counter = Counter()  # document frequency: in how many docs each term appears
+    corpus_counter = Counter()
     for _, row in df.iterrows():
         txt_path = str(row.get("text_file", ""))
         if not txt_path or not os.path.exists(txt_path):
@@ -651,10 +442,10 @@ def main():
         if result is None:
             continue
 
-        flat, detail, tf = result
+        flat, detail = result
         rows.append(flat)
-        doc_tfs.append(tf)
-        df_counter.update(tf.keys())
+        corpus_counter.update(dict(detail["top_keywords_full"]))
+
 
         safe_name = re.sub(r"[^\w]", "_", flat["company"])[:60]
         json_path = os.path.join(args.out_dir, f"{safe_name}_{flat['isin']}.json")
@@ -665,46 +456,19 @@ def main():
         log.warning("No results produced.")
         return
 
-    # exclude company-name tokens + a few report-specific acronyms so TF-IDF
-    # surfaces themes, not entity names (axa, bnp, santander ...)
-    entity_tokens = set()
-    for name in out_df_companies(rows):
-        for tok in re.findall(r"[a-z]{3,}", str(name).lower()):
-            entity_tokens.add(tok)
-    entity_tokens |= {"nfis", "rse", "csr", "gri", "sasb", "tcfd", "ifrs"}
-    tfidf_ranked = corpus_tfidf(doc_tfs, df_counter, exclude=entity_tokens)
-
     out_df = pd.DataFrame(rows)
     out_df.to_csv(args.out_csv, index=False)
     log.info("NLP results saved to %s (%d rows)", args.out_csv, len(rows))
 
     #_________________ visual output
-    make_charts(out_df, tfidf_ranked, args.charts_dir)
+    make_charts(out_df, corpus_counter, args.charts_dir)
 
-    #_________________ research summary
-    n = len(out_df)
-    log.info("=" * 60)
-    log.info("CSRD / ESRS ANALYSIS — %d English reports", n)
-    log.info("=" * 60)
-    log.info("Dominant ESG pillar:\n%s", out_df["dominant_pillar"].value_counts().to_string())
-    log.info("Avg ESG keyword hits — env %.0f | soc %.0f | gov %.0f",
-             out_df["environment"].mean(), out_df["social"].mean(), out_df["governance"].mean())
-
-    log.info("--- ESRS topical-standard coverage (share of reports, >=%d matches) ---",
-             ESRS_COVER_THRESHOLD)
-    cov = {s: (out_df[f"esrs::{s}"] >= ESRS_COVER_THRESHOLD).mean() for s in ESRS_STANDARDS}
-    for s, v in sorted(cov.items(), key=lambda kv: -kv[1]):
-        log.info("  %-26s %5.1f%%", s, v * 100)
-    log.info("  avg ESRS standards covered per report: %.1f of %d",
-             out_df["esrs_standards_covered"].mean(), len(ESRS_STANDARDS))
-
-    log.info("--- CSRD concept adoption (share of reports mentioning) ---")
-    adopt = {c: out_df[f"concept::{c}"].mean() for c in CSRD_CONCEPTS}
-    for c, v in sorted(adopt.items(), key=lambda kv: -kv[1]):
-        log.info("  %-26s %5.1f%%", c, v * 100)
-
-    log.info("--- most distinctive corpus terms (TF-IDF) ---")
-    log.info("  %s", ", ".join(w for w, _ in tfidf_ranked[:15]))
+    #_________________ summary stats
+    log.info("--- ESG hit averages ---")
+    for p in THEMES:
+        log.info("  %-15s avg hits: %.1f", p, out_df[p].mean())
+    log.info("  dominant pillar distribution:\n%s",
+             out_df["dominant_pillar"].value_counts().to_string())
 
 
 if __name__ == "__main__":    main()
