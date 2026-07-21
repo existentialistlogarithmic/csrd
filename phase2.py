@@ -41,6 +41,9 @@ PILLAR_COLORS = {
     "governance":  "#eda100",
 }
 
+# ordered years get an ordinal ramp (light = earlier), validated steps
+YEAR_RAMP = ["#86b6ef", "#2a78d6", "#184f95"]
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -352,6 +355,7 @@ def process_file(txt_path: str, meta: dict):
     flat = {
         "company":         meta.get("company", ""),
         "isin":            meta.get("isin", ""),
+        "report_year":     meta.get("report_year", ""),
         "country":         meta.get("country", ""),
         "industry":        meta.get("industry", ""),
         "sector":          meta.get("sector", ""),
@@ -392,8 +396,11 @@ def _stem_from_meta(row: dict) -> str:
     """Reconstruct the filename stem that phase1 would have used."""
     name = re.sub(r"[^\w\s-]", "", str(row.get("company", "")))
     name = re.sub(r"\s+", "_", name.strip())
-    return f"{name}_{row.get('isin', '')}"
-
+    stem = f"{name}_{row.get('isin', '')}"
+    year = row.get("report_year", "")
+    if str(year).strip() not in ("", "nan"):
+        stem += f"_{int(float(year))}"
+    return stem
 
 # _________________charts
 
@@ -555,6 +562,32 @@ def chart_distinctive_terms(tfidf_ranked, path, top_n=15):
     ax.tick_params(axis="x", labelbottom=False)
     _save(fig, path)
 
+def chart_year_comparison(out_df, path):
+    """Average ESG density per pillar, one bar group per report year."""
+    years = sorted({int(y) for y in pd.to_numeric(out_df.get("report_year"),
+                                                  errors="coerce").dropna().unique()})
+    if len(years) < 2:
+        return
+    pillars = list(THEMES)
+    width = 0.8 / len(years)
+    fig, ax = _new_axes(7, 4.2)
+    ax.yaxis.grid(True, color=GRIDLINE, linewidth=0.8)
+    sub_year = pd.to_numeric(out_df["report_year"], errors="coerce")
+    for i, year in enumerate(years):
+        sub = out_df[sub_year == year]
+        vals = [sub[f"{p}_density"].mean() for p in pillars]
+        xs = [j + (i - (len(years) - 1) / 2) * width for j in range(len(pillars))]
+        bars = ax.bar(xs, vals, width=width * 0.9, label=str(year),
+                      color=YEAR_RAMP[i % len(YEAR_RAMP)])
+        ax.bar_label(bars, fmt="%.2f", padding=3, color=INK_SECONDARY, fontsize=8)
+    ax.set_xticks(range(len(pillars)))
+    ax.set_xticklabels(pillars)
+    ax.set_title("ESG focus by report year (avg share of keyword hits)",
+                 loc="left", color=INK, fontsize=12, pad=30)
+    ax.set_ylabel("Avg density", color=INK_SECONDARY, fontsize=9)
+    ax.legend(loc="lower left", bbox_to_anchor=(0, 1.0), ncol=len(years),
+              frameon=False, fontsize=9, labelcolor=INK_SECONDARY)
+    _save(fig, path)
 
 def make_charts(out_df, tfidf_ranked, charts_dir):
     os.makedirs(charts_dir, exist_ok=True)
