@@ -103,6 +103,117 @@ def load_reports(path):
              len(df), len(valid), int(no_range.sum()))
     return valid.reset_index(drop=True)
 
+# 1b SRN API source ---
+
+def _pick(d, *keys, default=None):
+    """First non-empty value among several possible key spellings."""
+    for k in keys:
+        v = d.get(k)
+        if v not in (None, ""):
+            return v
+    return default
+
+
+def _srn_get_json(path):
+    """GET a JSON payload from the first SRN API base that answers."""
+    headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
+    for base in SRN_API_BASES:
+        url = base.rstrip("/") + path
+        resp = _fetch_with_retries(url, headers, max_retries=1)
+        if resp is None:
+            continue
+        try:
+            return resp.json(), base
+        except ValueError:
+            log.debug("Non-JSON response from %s", url)
+    return None, None
+
+
+def _srn_items(payload):
+    """API may return a bare list or wrap it in data/items/results."""
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        for k in ("data", "items", "results", "documents", "companies"):
+            if isinstance(payload.get(k), list):
+                return payload[k]
+    return []
+
+
+def load_reports_srn(years):
+    """Build the same dataframe shape as load_reports, but from the SRN API.
+
+    Every report gets a report_year; page ranges are unknown, so the full
+    document is extracted downstream."""
+    log.info("Querying SRN API for report documents (years: %s) ...",
+             ", ".join(str(y) for y in years))
+
+    companies_raw, base = _srn_get_json("/companies")
+    if companies_raw is None:
+        log.error("Could not reach any SRN API endpoint (%s). "
+                  "Check network access / endpoint list.", ", ".join(SRN_API_BASES))
+        return pd.DataFrame()
+    log.info("SRN API base: %s (%d companies)", base, len(_srn_items(companies_raw)))
+
+    companies = {}
+    for c in _srn_items(companies_raw):
+        cid = _pick(c, "id", "company_id", "uuid")
+        companies[cid] = {
+            "company": _pick(c, "name", "company", "company_name", default=""),
+            "isin": _pick(c, "isin", "ISIN", default=""),
+            "country": _pick(c, "country", "country_name", default=""),
+            "sector": _pick(c, "sector", "sics_sector", "SASB sector", default=""),
+            "industry": _pick(c, "industry", "sics_industry", "SASB industry", default=""),
+        }
+
+    docs_raw, _ = _srn_get_json("/documents")
+    docs = _srn_items(docs_raw) if docs_raw is not None else []
+    if not docs:
+        log.error("SRN API returned no documents.")
+        return pd.DataFrame()
+
+    types_seen = sorted({str(_pick(d, "type", "doc_type", "document_type", default="?"))
+                         for d in docs})
+    log.info("SRN document types seen: %s", ", ".join(types_seen))
+
+    rows = []
+    for d in docs:
+        year = _pick(d, "year", "fiscal_year", "reporting_year")
+        try:
+            year = int(str(year)[:4])
+        except (TypeError, ValueError):
+            continue
+        if year not in years:
+            continue
+        dtype = str(_pick(d, "type", "doc_type", "document_type", default="")).lower()
+        # keep annual/sustainability/CSRD reports, skip presentations etc.
+        if dtype and not any(t in dtype for t in ("ar", "annual", "sr", "sustain", "csrd", "report")):
+            continue
+        did = _pick(d, "id", "document_id", "uuid")
+        href = _pick(d, "href", "url", "download_url", "link",
+                     default=f"{base.rstrip('/')}/documents/{did}/download")
+        meta = companies.get(_pick(d, "company_id", "company", "companyId"), {})
+        rows.append({
+            "company": meta.get("company") or _pick(d, "company_name", "name", default=str(did)),
+            "isin": meta.get("isin", ""),
+            "country": meta.get("country", ""),
+            "SASB industry": meta.get("industry", ""),
+            "SASB sector": meta.get("sector", ""),
+            "link": href,
+            "start PDF": pd.NA,
+            "end PDF": pd.NA,
+            "report_year": year,
+        })
+
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df["start PDF"] = df["start PDF"].astype("Int64")
+        df["end PDF"] = df["end PDF"].astype("Int64")
+        per_year = df["report_year"].value_counts().sort_index().to_dict()
+        log.info("SRN reports selected: %d (%s)", len(df),
+                 ", ".join(f"{y}: {n}" for y, n in per_year.items()))
+    return df.reset_index(drop=True)
+
 
 # 2 downloads pdfs ---
 def _fetch_with_retries(url, headers, timeout=TIMEOUT, max_retries=MAX_RETRIES):
@@ -250,6 +361,14 @@ def download_pdf(url, dest):
 
     return "success"
 
+def report_stem(row):
+    """Filename stem for one report; includes the year when known so a
+    company's 2024 and 2025 reports don't overwrite each other."""
+    stem = f"{clean_filename(str(row['company']))}_{row['isin']}"
+    year = row.get("report_year")
+    if year is not None and not pd.isna(year):
+        stem += f"_{int(year)}"
+    return stem
 
 def download_all(df):
     statuses = {}
@@ -264,7 +383,7 @@ def download_all(df):
             company = str(row["company"])
             isin = str(row["isin"])
             url = str(row["link"])
-            dest = os.path.join(PDF_DIR, f"{clean_filename(company)}_{isin}.pdf")
+            dest = os.path.join(PDF_DIR, f"{report_stem(row)}.pdf")
 
             log.info("[%d/%d] %s", pos + 1, len(df), company)
             status = download_pdf(url, dest)
@@ -361,7 +480,7 @@ def detect_language(text):
         return "unknown"
 
 
-def process_one_pdf(pdf_path, company, isin, start, end):
+def process_one_pdf(pdf_path, stem, start, end):
     """Extract text + tables from one PDF. Returns a dict with metadata."""
     result = {
         "text_file": None,
@@ -372,8 +491,6 @@ def process_one_pdf(pdf_path, company, isin, start, end):
         "language": "unknown",
         "extraction_status": "success",
     }
-
-    stem = f"{clean_filename(company)}_{isin}"
 
     # get the text
     text = extract_text(pdf_path, start, end)
@@ -431,6 +548,7 @@ def build_summary(df, download_statuses, extraction_results):
         rows.append({
             "company": str(row["company"]),
             "isin": str(row["isin"]),
+            "report_year": row.get("report_year", ""),
             "country": row.get("country", ""),
             "industry": row.get(industry_col, ""),
             "sector": row.get(sector_col, ""),
@@ -452,6 +570,11 @@ def build_summary(df, download_statuses, extraction_results):
 
 def main():
     parser = argparse.ArgumentParser(description="CSRD PDF scraping pipeline")
+    parser.add_argument("--source", choices=["excel", "srn"], default="excel",
+                        help="excel: links from the SRN archive spreadsheet; "
+                             "srn: report list + PDFs from the SRN API (srnav.com)")
+    parser.add_argument("--years", default="2024,2025",
+                        help="Fiscal years to fetch with --source srn (comma-separated)")
     parser.add_argument("--excel-file", default=EXCEL_FILE, help="Input Excel file")
     parser.add_argument("--limit", type=int, help="Only process first N reports")
     parser.add_argument("--start-from", type=int, default=0, help="Resume from this index")
@@ -466,8 +589,12 @@ def main():
         os.makedirs(d, exist_ok=True)
 
     # load and filter
-    df = load_reports(args.excel_file)
-
+    if args.source == "srn":
+        years = {int(y) for y in args.years.split(",") if y.strip()}
+        df = load_reports_srn(years)
+    else:
+        df = load_reports(args.excel_file)
+        
     if args.start_from > 0:
         df = df.iloc[args.start_from:]
         log.info("Starting from index %d (%d left)", args.start_from, len(df))
@@ -516,8 +643,8 @@ def main():
 
     for idx, row in df.iterrows():
         company = str(row["company"])
-        isin = str(row["isin"])
-        pdf_path = os.path.join(PDF_DIR, f"{clean_filename(company)}_{isin}.pdf")
+        stem = report_stem(row)
+        pdf_path = os.path.join(PDF_DIR, f"{stem}.pdf")
         start = None if pd.isna(row["start PDF"]) else int(row["start PDF"])
         end = None if pd.isna(row["end PDF"]) else int(row["end PDF"])
 
@@ -548,7 +675,7 @@ def main():
             log.info("[%d/%d] Extracting %s (pages %d-%d)", idx+1, len(df), company, start, end)
         else:
             log.info("[%d/%d] Extracting %s (full document)", idx+1, len(df), company)
-        extraction_results[idx] = process_one_pdf(pdf_path, company, isin, start, end)
+        extraction_results[idx] = process_one_pdf(pdf_path, stem, start, end)
         r = extraction_results[idx]
         log.info("  %d pages, %d words, %d tables, language: %s",
                  r["pages_extracted"], r["word_count"], r["tables_found"], r["language"])
