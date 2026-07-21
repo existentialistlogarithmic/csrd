@@ -22,6 +22,15 @@ EXCEL_FILE = "SRN-CSRD_report_archive.xlsx"
 SHEET_NAME = "csrd"
 HEADER_ROW = 2  # 0-indexed, so row 3 in the spreadsheet
 
+# SRN (Sustainability Reporting Navigator, srnav.com) API — hosts the report
+# PDFs itself, so downloads don't depend on 500 different company websites.
+# Endpoint variants are probed in order; the first that answers JSON wins.
+SRN_API_BASES = [
+    "https://api.srnav.com/api",
+    "https://www.srnav.com/api",
+    "https://api.sustainabilityreportingnavigator.com/api",
+]
+
 PDF_DIR = "pdfs"
 TEXT_DIR = "extracted_text"
 TABLE_DIR = "extracted_tables"
