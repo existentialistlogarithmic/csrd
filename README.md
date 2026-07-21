@@ -69,3 +69,6 @@ python3 phase3_local.py --limit 5                       # local Ollama, first fe
 python3 phase3_local.py --model qwen2.5:32b             # bigger local model (e.g. on ADA)
 python3 phase3_local.py --chunk-chars 120000           # split long reports for small models
 python3 phase3_local.py --provider groq --model llama-3.3-70b-versatile   # free API tier
+
+
+# If all goes well since they have updated their website with direct pdf links phase_extra_error_pdfs can be discarded.
