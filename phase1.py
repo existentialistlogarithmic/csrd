@@ -12,7 +12,7 @@ import time
 import fitz          # pip install pymupdf
 import pandas as pd
 import requests
-from urllib.parse import urljoin, urlsplit, parse_qs, unquote
+from urllib.parse import urljoin
 
 from langdetect import detect, DetectorFactory, LangDetectException  # pip install langdetect
 DetectorFactory.seed = 0  # make detection deterministic
@@ -37,9 +37,9 @@ TABLE_DIR = "extracted_tables"
 DOWNLOAD_LOG = "download_log.csv"
 SUMMARY_CSV = "extraction_summary.csv"
 
-DELAY = 1.0      # seconds between downloads
-TIMEOUT = int(os.environ.get("DL_TIMEOUT", "60"))   # seconds per request
-MAX_RETRIES = int(os.environ.get("DL_RETRIES", "3"))  # retries for timeout/connection errors
+DELAY = 1.5      # seconds between downloads
+TIMEOUT = 60     # seconds per request
+MAX_RETRIES = 3  # retries for timeout/connection errors
 USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
               "AppleWebKit/537.36 (KHTML, like Gecko) "
               "Chrome/124.0.0.0 Safari/537.36")
@@ -56,28 +56,6 @@ def clean_filename(name):
     """Remove special chars, replace spaces with underscores."""
     name = re.sub(r"[^\w\s-]", "", name)
     return re.sub(r"\s+", "_", name.strip())
-
-
-def _unwrap_redirect(url):
-    """A handful of spreadsheet links are Google search redirect wrappers
-    (google.com/url?...&url=<real target>&...) instead of the real link."""
-    parts = urlsplit(url)
-    if parts.netloc.endswith("google.com") and parts.path == "/url":
-        qs = parse_qs(parts.query)
-        real = qs.get("url") or qs.get("q")
-        if real:
-            return unquote(real[0])
-    return url
-
-
-def _build_headers(url):
-    origin = f"{urlsplit(url).scheme}://{urlsplit(url).netloc}/"
-    return {
-        "User-Agent": USER_AGENT,
-        "Accept": "application/pdf,text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": origin,
-    }
 
 
 # 1 read thru excel n filter---
@@ -102,6 +80,7 @@ def load_reports(path):
     log.info("Total rows: %d | With link: %d (no page range: %d, will extract full document)",
              len(df), len(valid), int(no_range.sum()))
     return valid.reset_index(drop=True)
+
 
 # 1b SRN API source ---
 
@@ -219,7 +198,6 @@ def load_reports_srn(years):
 def _fetch_with_retries(url, headers, timeout=TIMEOUT, max_retries=MAX_RETRIES):
     """Fetch a URL with SSL fallback and retry on timeout/connection errors."""
     last_err = None
-    origin = f"{urlsplit(url).scheme}://{urlsplit(url).netloc}/"
     for attempt in range(1, max_retries + 1):
         for verify in (True, False):
             try:
@@ -228,18 +206,6 @@ def _fetch_with_retries(url, headers, timeout=TIMEOUT, max_retries=MAX_RETRIES):
                     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
                     log.info("  Retrying without SSL (attempt %d/%d)...", attempt, max_retries)
                 resp = requests.get(url, headers=headers, timeout=timeout, verify=verify)
-                if resp.status_code == 403 and attempt == 1 and origin != url:
-                    # some WAFs block bare GETs but allow a session that first
-                    # visited the homepage (looks less like a bot / picks up cookies)
-                    try:
-                        s = requests.Session()
-                        s.get(origin, headers=headers, timeout=timeout, verify=verify)
-                        warm_resp = s.get(url, headers=headers, timeout=timeout, verify=verify)
-                        if warm_resp.status_code != 403:
-                            log.info("  Recovered 403 via homepage warm-up: %s", url)
-                            resp = warm_resp
-                    except requests.RequestException:
-                        pass
                 resp.raise_for_status()
                 return resp
             except requests.exceptions.SSLError:
@@ -270,19 +236,6 @@ def _find_pdf_link_in_html(html_bytes, base_url):
         html = html_bytes.decode("utf-8", errors="ignore")
     except Exception:
         return None
-
-    # some report pages are just a redirect wrapper:
-    # <meta http-equiv="refresh" content="0;url=...">
-    refresh = re.search(
-        r'http-equiv=["\']refresh["\'][^>]*content=["\'][^"\']*url=([^"\'>]+)',
-        html, re.IGNORECASE,
-    )
-    if refresh:
-        target = urljoin(base_url, refresh.group(1).strip())
-        if target.lower() != base_url.lower():
-            log.info("  Found meta-refresh redirect: %s", target)
-            return target
-
     # look for links ending in .pdf (common pattern for report download pages)
     pdf_links = re.findall(r'href=["\']([^"\']*\.pdf(?:\?[^"\']*)?)["\']', html, re.IGNORECASE)
     if not pdf_links:
@@ -307,12 +260,7 @@ def download_pdf(url, dest):
         log.info("  Already exists, skipping")
         return "skipped"
 
-    unwrapped = _unwrap_redirect(url)
-    if unwrapped != url:
-        log.info("  Unwrapped redirect link: %s", unwrapped)
-        url = unwrapped
-
-    headers = _build_headers(url)
+    headers = {"User-Agent": USER_AGENT}
 
     resp = _fetch_with_retries(url, headers)
     if resp is None:
@@ -330,7 +278,7 @@ def download_pdf(url, dest):
         if "html" in content_type:
             pdf_url = _find_pdf_link_in_html(data, url)
             if pdf_url:
-                resp2 = _fetch_with_retries(pdf_url, _build_headers(pdf_url))
+                resp2 = _fetch_with_retries(pdf_url, headers)
                 if resp2 is not None:
                     data2 = resp2.content
                     ct2 = resp2.headers.get("Content-Type", "").lower()
@@ -361,6 +309,7 @@ def download_pdf(url, dest):
 
     return "success"
 
+
 def report_stem(row):
     """Filename stem for one report; includes the year when known so a
     company's 2024 and 2025 reports don't overwrite each other."""
@@ -369,6 +318,7 @@ def report_stem(row):
     if year is not None and not pd.isna(year):
         stem += f"_{int(year)}"
     return stem
+
 
 def download_all(df):
     statuses = {}
@@ -379,13 +329,13 @@ def download_all(df):
         if is_new:
             writer.writerow(["index", "company", "isin", "url", "status", "dest"])
 
-        for pos, (idx, row) in enumerate(df.iterrows()):
+        for idx, row in df.iterrows():
             company = str(row["company"])
             isin = str(row["isin"])
             url = str(row["link"])
             dest = os.path.join(PDF_DIR, f"{report_stem(row)}.pdf")
 
-            log.info("[%d/%d] %s", pos + 1, len(df), company)
+            log.info("[%d/%d] %s", idx + 1, len(df), company)
             status = download_pdf(url, dest)
             statuses[idx] = status
             writer.writerow([idx, company, isin, url, status, dest])
@@ -397,15 +347,6 @@ def download_all(df):
                 time.sleep(DELAY)
 
     return statuses
-
-
-def dedup_download_log():
-    """Keep only the latest status per row index (retry runs append new rows)."""
-    if not os.path.exists(DOWNLOAD_LOG):
-        return
-    d = pd.read_csv(DOWNLOAD_LOG)
-    d = d.drop_duplicates(subset="index", keep="last").sort_values("index")
-    d.to_csv(DOWNLOAD_LOG, index=False)
 
 
 # -3 get txt ffrom tables (this will return it bin...)
@@ -426,7 +367,10 @@ def extract_text(pdf_path, start, end):
 
     pages = []
     for p in range(start - 1, min(end, len(doc))):
-        pages.append(doc[p].get_text("text", flags=fitz.TEXT_PRESERVE_LIGATURES))
+        # prefix each page with a [[page:N]] marker so downstream ESRS
+        # extraction (phase3) can cite page numbers; N is the 1-indexed PDF page
+        body = doc[p].get_text("text", flags=fitz.TEXT_PRESERVE_LIGATURES)
+        pages.append(f"[[page:{p + 1}]]\n{body}")
     doc.close()
     return "\n\n".join(pages)
 
@@ -509,7 +453,8 @@ def process_one_pdf(pdf_path, stem, start, end):
     eff_start = start if start is not None else 1
     eff_end = end if end is not None else total_pages
     result["pages_extracted"] = max(0, min(eff_end, total_pages) - (eff_start - 1))
-    result["word_count"] = len(text.split())
+    # count words on the marker-free text so [[page:N]] markers don't inflate it
+    result["word_count"] = len(re.sub(r"\[\[page:\d+\]\]", " ", text).split())
     result["language"] = detect_language(text)
 
     # save the text
@@ -578,10 +523,6 @@ def main():
     parser.add_argument("--excel-file", default=EXCEL_FILE, help="Input Excel file")
     parser.add_argument("--limit", type=int, help="Only process first N reports")
     parser.add_argument("--start-from", type=int, default=0, help="Resume from this index")
-    parser.add_argument("--retry-failed", action="store_true",
-                         help="Only re-attempt rows whose last recorded download status "
-                              "wasn't success/skipped; reuse everything else from the "
-                              "existing download_log.csv / extraction_summary.csv")
     args = parser.parse_args()
 
     # create output folders
@@ -594,7 +535,7 @@ def main():
         df = load_reports_srn(years)
     else:
         df = load_reports(args.excel_file)
-        
+
     if args.start_from > 0:
         df = df.iloc[args.start_from:]
         log.info("Starting from index %d (%d left)", args.start_from, len(df))
@@ -607,33 +548,11 @@ def main():
         log.warning("Nothing to process.")
         return
 
-    prev_summary_by_key = {}
-    retry_idx = set(df.index)
-    if args.retry_failed:
-        prev_log = None
-        if os.path.exists(DOWNLOAD_LOG):
-            prev_log = pd.read_csv(DOWNLOAD_LOG).drop_duplicates(subset="index", keep="last").set_index("index")
-        if os.path.exists(SUMMARY_CSV):
-            for _, r in pd.read_csv(SUMMARY_CSV).iterrows():
-                prev_summary_by_key[(str(r["company"]), str(r["isin"]))] = r
-        if prev_log is not None:
-            prev_status = prev_log["status"].to_dict()
-            retry_idx = {i for i in df.index if prev_status.get(i, "missing") not in ("success", "skipped")}
-        log.info("Retry mode: %d/%d rows need another attempt", len(retry_idx), len(df))
-
-    # download (only the rows that still need it, in retry mode)
+    # download
     log.info("=" * 50)
     log.info("STEP 2: Downloading PDFs")
     log.info("=" * 50)
-    sub_df = df.loc[sorted(retry_idx)] if args.retry_failed else df
-    if sub_df.empty:
-        log.info("Nothing left to (re-)download.")
-    else:
-        download_all(sub_df)
-    dedup_download_log()
-
-    full_log = pd.read_csv(DOWNLOAD_LOG).drop_duplicates(subset="index", keep="last").set_index("index")
-    download_statuses = {i: full_log["status"].get(i, "unknown") for i in df.index}
+    download_statuses = download_all(df)
 
     # extract
     log.info("=" * 50)
@@ -649,21 +568,6 @@ def main():
         end = None if pd.isna(row["end PDF"]) else int(row["end PDF"])
 
         status = download_statuses.get(idx, "unknown")
-
-        # row wasn't retried this run and we already have its extraction result: reuse it
-        if idx not in retry_idx and (company, isin) in prev_summary_by_key:
-            r = prev_summary_by_key[(company, isin)]
-            extraction_results[idx] = {
-                "text_file": r.get("text_file") or None,
-                "table_file": r.get("table_file") or None,
-                "word_count": int(r.get("word_count") or 0),
-                "pages_extracted": int(r.get("pages_extracted") or 0),
-                "tables_found": int(r.get("tables_found") or 0),
-                "language": r.get("language", "unknown"),
-                "extraction_status": r.get("extraction_status", "not_attempted"),
-            }
-            continue
-
         if status not in ("success", "skipped"):
             log.info("[%d/%d] Skipping %s (download: %s)", idx+1, len(df), company, status)
             continue
