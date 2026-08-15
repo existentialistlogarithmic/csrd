@@ -31,15 +31,14 @@ Local setup (free path):
     python3 phase3_local.py --provider groq --model llama-3.3-70b-versatile   # free API tier
 """
 import argparse
-import json
 import logging
 import os
 
 # reuse the report selection, prompt loading, JSON parsing, chunking, merging
 # and coverage flattening — only the model backend differs from phase3_esrs
 from phase3_esrs import (
-    chunk_text, flatten, load_prompt, merge_results, read_text, robust_json,
-    select_reports, write_outputs,
+    chunk_text, load_prompt, merge_results, robust_json,
+    run_jobs, select_reports, write_outputs,
     FAIL_CSV, OUT_CSV, OUT_DIR, PROMPT_FILE, SUMMARY_CSV, TEXT_DIR,
 )
 
@@ -123,6 +122,9 @@ def main():
                         help="Split reports longer than this many chars (for small-context models); 0 = never")
     parser.add_argument("--no-json-mode", action="store_true",
                         help="Don't request response_format=json_object (some models/servers reject it)")
+    parser.add_argument("--concurrency", type=int, default=4,
+                        help="Reports extracted in parallel. Keep this at or below "
+                             "the server's parallel slots (Ollama defaults to 4)")
     parser.add_argument("--limit", type=int)
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
@@ -139,26 +141,14 @@ def main():
 
     client = make_client(args)
     base_url = args.base_url or PROVIDERS[args.provider][0]
-    log.info("%d report(s) to extract via %s (%s), model=%s",
-             len(jobs), args.provider, base_url, args.model)
+    log.info("%d report(s) to extract via %s (%s), model=%s, %d at a time",
+             len(jobs), args.provider, base_url, args.model, args.concurrency)
 
-    rows, failures = [], []
-    for i, job in enumerate(jobs, 1):
-        log.info("[%d/%d] %s", i, len(jobs), job["stem"])
-        try:
-            result = extract_one(client, args.model, prompt, read_text(job["text_path"]),
-                                 args.chunk_chars, not args.no_json_mode)
-        except Exception as e:  # noqa: BLE001 — log and keep going
-            log.error("  failed: %s", e)
-            failures.append({"stem": job["stem"], "error": str(e)})
-            continue
-        with open(job["out_path"], "w", encoding="utf-8") as f:
-            json.dump(result, f, ensure_ascii=False, indent=2)
-        rows.append(flatten(job["meta"], result))
-        cov = result.get("coverage_summary", {})
-        log.info("  %d disclosures, %s material DRs reported",
-                 len(result.get("disclosures", [])), cov.get("material_drs_reported", "?"))
-
+    rows, failures = run_jobs(
+        jobs,
+        lambda text: extract_one(client, args.model, prompt, text,
+                                 args.chunk_chars, not args.no_json_mode),
+        args.concurrency)
     write_outputs(rows, failures, args.out_csv, FAIL_CSV)
 
 

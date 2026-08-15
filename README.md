@@ -32,9 +32,16 @@ python3 phase1.py                    # the whole live corpus
 python3 phase1.py --limit 20         # smoke test
 python3 phase1.py --years 2025       # one fiscal year ('all' for every year)
 python3 phase1.py --workers 24       # more download concurrency
-python3 phase1.py --no-tables        # text only, roughly 3x faster
+python3 phase1.py --no-tables        # text only, ~20x faster parsing
 python3 phase1.py --source excel     # legacy: links from the archive spreadsheet
+python3 phase1.py --discard-pdfs     # delete each PDF once parsed (GBs, not tens)
+python3 phase1.py --max-pending 24   # cap fetched-but-unparsed PDFs (disk backpressure)
 ```
+
+A full run over all ~1,990 reports is about 15 minutes of downloading, fully
+overlapped with roughly three hours of parsing on four cores. Table detection is
+essentially the whole of that cost, so `--no-tables` turns the three hours into
+minutes when you only need the text.
 
 Outputs:
 
@@ -51,8 +58,7 @@ Outputs:
 auditor, `csrd_compliant`, publication date, sustainability page range) next to
 the extraction results (language, pages, word count, tables found, file paths).
 
-**Why it's fast.** Three things, worth roughly two orders of magnitude together
-against a naive serial loop:
+**Why it's fast.**
 
 * **Page ranges.** SRN publishes where the sustainability statement sits inside
   each annual report, so a 125 MB / 400-page filing is parsed over its ~90
@@ -60,15 +66,29 @@ against a naive serial loop:
   downstream analysis — no financial-statement boilerplate in the corpus.
 * **Per-host concurrency.** Downloads run in a thread pool but the throttle is
   *per host*, so ~1 500 different company web servers are hit in parallel while
-  no single server ever sees two concurrent requests. Measured at ~130
+  no single server ever sees two concurrent requests. Measured at ~175
   reports/min against the old fixed 1.5 s sleep between every download.
-* **A process pool for parsing.** PyMuPDF is CPU-bound and holds the GIL, so
-  extraction is spread across cores. Each document is opened once and each page
-  visited once for text *and* tables.
+* **Fetching and parsing overlap.** They are not two phases. A PDF goes to the
+  process pool the moment its bytes land, so the cores are busy while the next
+  batch is still in flight and the run costs about as long as the slower half
+  rather than the sum of both.
+* **A process pool for parsing.** PyMuPDF is CPU-bound and holds the GIL. Each
+  document is opened once and each page visited once for text *and* tables, and
+  pages with no vector drawings skip the table finder entirely — it cannot find
+  a ruled table where nothing is drawn, and it costs ~40x a text extraction.
 
-Everything is resumable. A valid PDF already on disk is not re-downloaded, and a
-text file newer than its PDF is not re-parsed. Use `--refresh` / `--re-extract`
-to force either, and `--skip-download` to parse what's already in `pdfs/`.
+**Backpressure.** Downloading is roughly 20x faster than parsing, so left alone
+the fetchers would put the whole ~40 GB of PDFs on disk long before the parsers
+reached them. A downloader takes one of `--max-pending` slots before it writes
+and gets it back when that PDF has been parsed, which holds disk flat at about
+`max-pending` × the average report. With `--discard-pdfs` each PDF is deleted
+the moment it is parsed, so a full run needs gigabytes rather than tens of them
+— the corpus you keep is the text, not the sources.
+
+Everything is resumable, including after `--discard-pdfs`: extraction is reused
+from the text file, which does not need the PDF to still exist. Use `--refresh`
+/ `--re-extract` to force either, and `--skip-download` to parse what's already
+in `pdfs/`.
 
 ### How failed downloads are handled
 
@@ -154,7 +174,12 @@ English reports only (language is detected in phase 1).
 ```bash
 python3 phase2.py
 python3 phase2.py --limit 5
+python3 phase2.py --workers 8     # scoring processes (default: CPU count)
 ```
+
+Scoring is pure CPU over the text and every report is independent, so it fans
+out across cores; each worker writes its own detail JSON and returns only the
+summary row.
 
 Outputs `nlp_results.csv`, per-company JSON in `nlp_output/`, and charts in
 `nlp_output/charts/`: `dominant_pillar.png`, `pillar_hits.png`,
@@ -195,6 +220,7 @@ python3 phase3_local.py --limit 5
 python3 phase3_local.py --model qwen2.5:32b            # bigger local model
 python3 phase3_local.py --chunk-chars 120000           # split long reports for small contexts
 python3 phase3_local.py --provider groq --model llama-3.3-70b-versatile   # free API tier
+python3 phase3_local.py --concurrency 4    # keep at or below the server's parallel slots
 ```
 
 **Hosted (Anthropic)** — higher quality, costs money. The system prompt is
@@ -203,7 +229,14 @@ prompt-cached, so it's billed once rather than per report:
 ```bash
 export ANTHROPIC_API_KEY=...
 python3 phase3_esrs.py --limit 5
+python3 phase3_esrs.py --concurrency 12    # reports in flight at once
 ```
+
+Every second of an extraction is spent waiting on the model, so both backends
+run reports concurrently rather than one at a time — `--concurrency` is the
+single knob that decides whether a full corpus takes an hour or a day. Results
+are written per report as they land, so an interrupted run resumes from what is
+already in `esrs_output/`.
 
 Both backends share `phase3_esrs.py` for report selection, prompt loading, JSON
 repair, chunking and coverage flattening, so their output is directly

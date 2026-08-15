@@ -26,7 +26,9 @@ import json
 import logging
 import os
 import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
 
@@ -365,6 +367,48 @@ def extract_one(client, model, prompt, text, chunk_chars):
                           for chunk in chunk_text(text, chunk_chars)])
 
 
+def run_jobs(jobs, extract, concurrency, flatten_meta=True):
+    """Run per-report extraction concurrently and collect (rows, failures).
+
+    Every second of an extraction is spent waiting on a model, so the work is
+    I/O-bound and threads are the right tool — a pool of them turns a corpus
+    that would take a day serially into one that takes an hour. ``extract`` is
+    a callable taking the report text and returning the parsed result.
+
+    Results are written per report as they land, so an interrupted run resumes
+    from what is already on disk.
+    """
+    rows, failures = [], []
+    lock = threading.Lock()
+    done = 0
+
+    def work(job):
+        result = extract(read_text(job["text_path"]))
+        with open(job["out_path"], "w", encoding="utf-8") as f:
+            json.dump(result, f, ensure_ascii=False, indent=2)
+        return result
+
+    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        futures = {pool.submit(work, job): job for job in jobs}
+        for future in as_completed(futures):
+            job = futures[future]
+            with lock:
+                done += 1
+                n = done
+            try:
+                result = future.result()
+            except Exception as e:                    # noqa: BLE001 - log and keep going
+                log.error("[%d/%d] %s failed: %s", n, len(jobs), job["stem"], e)
+                failures.append({"stem": job["stem"], "error": str(e)})
+                continue
+            rows.append(flatten(job["meta"], result) if flatten_meta else result)
+            coverage = result.get("coverage_summary", {})
+            log.info("[%d/%d] %s — %d disclosures, %s material DRs reported",
+                     n, len(jobs), job["stem"], len(result.get("disclosures", [])),
+                     coverage.get("material_drs_reported", "?"))
+    return rows, failures
+
+
 def main():
     ap = argparse.ArgumentParser(description="CSRD ESRS extraction — Anthropic API")
     ap.add_argument("--summary", default=SUMMARY_CSV)
@@ -375,6 +419,8 @@ def main():
     ap.add_argument("--api-key", help="Overrides $ANTHROPIC_API_KEY")
     ap.add_argument("--chunk-chars", type=int, default=0,
                     help="Split reports longer than this many chars (0 = never)")
+    ap.add_argument("--concurrency", type=int, default=8,
+                    help="Reports extracted in parallel (the work is API wait, not CPU)")
     ap.add_argument("--limit", type=int)
     ap.add_argument("--overwrite", action="store_true")
     args = ap.parse_args()
@@ -391,26 +437,13 @@ def main():
         return
 
     client = make_client(args.api_key)
-    log.info("%d report(s) to extract with %s", len(jobs), args.model)
+    log.info("%d report(s) to extract with %s, %d at a time",
+             len(jobs), args.model, args.concurrency)
 
-    rows, failures = [], []
-    for i, job in enumerate(jobs, 1):
-        log.info("[%d/%d] %s", i, len(jobs), job["stem"])
-        try:
-            result = extract_one(client, args.model, prompt,
-                                 read_text(job["text_path"]), args.chunk_chars)
-        except Exception as e:                        # noqa: BLE001 - log and keep going
-            log.error("  failed: %s", e)
-            failures.append({"stem": job["stem"], "error": str(e)})
-            continue
-        with open(job["out_path"], "w", encoding="utf-8") as f:
-            json.dump(result, f, ensure_ascii=False, indent=2)
-        rows.append(flatten(job["meta"], result))
-        coverage = result.get("coverage_summary", {})
-        log.info("  %d disclosures, %s material DRs reported",
-                 len(result.get("disclosures", [])),
-                 coverage.get("material_drs_reported", "?"))
-
+    rows, failures = run_jobs(
+        jobs,
+        lambda text: extract_one(client, args.model, prompt, text, args.chunk_chars),
+        args.concurrency)
     write_outputs(rows, failures, args.out_csv, FAIL_CSV)
 
 

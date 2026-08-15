@@ -9,7 +9,9 @@ import json
 import logging
 import os
 import re
+import time
 from collections import Counter
+from concurrent.futures import ProcessPoolExecutor
 
 import pandas as pd
 
@@ -399,6 +401,24 @@ def make_charts(out_df, corpus_counter, charts_dir):
     chart_year_comparison(out_df, os.path.join(charts_dir, "esg_by_year.png"))
 
 
+def _score_one(job):
+    """Worker: score one report and write its detail JSON.
+
+    Returns ``(flat_row, keyword_counts)`` — the detail dict stays in the
+    worker so only a small row crosses the process boundary.
+    """
+    txt_path, meta, out_dir = job
+    result = process_file(txt_path, meta)
+    if result is None:
+        return None
+    flat, detail = result
+    safe_name = re.sub(r"[^\w]", "_", str(flat["company"]))[:60]
+    json_path = os.path.join(out_dir, f"{safe_name}_{flat['isin']}.json")
+    with open(json_path, "w", encoding="utf-8") as jf:
+        json.dump(detail, jf, ensure_ascii=False, indent=2)
+    return flat, dict(detail["top_keywords_full"])
+
+
 # _________________main
 
 def main():
@@ -409,6 +429,8 @@ def main():
     parser.add_argument("--out-dir",  default=NLP_OUT_DIR,  help="Folder for per-company JSON files")
     parser.add_argument("--charts-dir", default=CHART_DIR,  help="Folder for chart PNGs")
     parser.add_argument("--limit",    type=int,             help="Only process first N documents")
+    parser.add_argument("--workers",  type=int, default=max(1, (os.cpu_count() or 2)),
+                        help="Scoring processes (default: CPU count)")
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -434,31 +456,33 @@ def main():
         df = df.iloc[:args.limit]
         log.info("Limiting to %d documents", args.limit)
 
-    rows = []
-    corpus_counter = Counter()
+    jobs = []
     for _, row in df.iterrows():
         txt_path = str(row.get("text_file", ""))
         if not txt_path or not os.path.exists(txt_path):
             txt_path = os.path.join(args.text_dir, f"{_stem_from_meta(row.to_dict())}.txt")
-
         if not os.path.exists(txt_path):
             log.warning("Text file missing for %s, skipping", row.get("company"))
             continue
+        jobs.append((txt_path, row.to_dict(), args.out_dir))
 
-        log.info("Processing %s", row.get("company"))
-        result = process_file(txt_path, row.to_dict())
-        if result is None:
-            continue
-
-        flat, detail = result
-        rows.append(flat)
-        corpus_counter.update(dict(detail["top_keywords_full"]))
-
-
-        safe_name = re.sub(r"[^\w]", "_", flat["company"])[:60]
-        json_path = os.path.join(args.out_dir, f"{safe_name}_{flat['isin']}.json")
-        with open(json_path, "w", encoding="utf-8") as jf:
-            json.dump(detail, jf, ensure_ascii=False, indent=2)
+    # Scoring a report is pure CPU over a few hundred KB of text, and the
+    # reports are independent, so this is a straight fan-out across cores.
+    # Each worker writes its own JSON; only the flat row comes back.
+    rows = []
+    corpus_counter = Counter()
+    log.info("Scoring %d reports across %d processes", len(jobs), args.workers)
+    started = time.monotonic()
+    with ProcessPoolExecutor(max_workers=args.workers) as pool:
+        for n, result in enumerate(pool.map(_score_one, jobs, chunksize=4), 1):
+            if result is None:
+                continue
+            flat, keywords = result
+            rows.append(flat)
+            corpus_counter.update(keywords)
+            if n % 50 == 0 or n == len(jobs):
+                log.info("  scored %d/%d", n, len(jobs))
+    log.info("Scoring finished in %.1f min", (time.monotonic() - started) / 60)
 
     if not rows:
         log.warning("No results produced.")
