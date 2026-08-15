@@ -1,0 +1,21 @@
+# Phase 1 — live index, download, text + table extraction
+requests>=2.31
+urllib3>=2.0
+pandas>=2.0
+pymupdf>=1.24
+openpyxl>=3.1          # only for --source excel
+
+# Language detection. Optional: phase1 falls back to a built-in function-word
+# detector if this isn't installed (langdetect needs a C toolchain on some
+# platforms). Install it when you want the stronger detector.
+langdetect>=1.0.9
+
+# Phase 2 — keyword/ESG analysis and charts
+matplotlib>=3.7
+
+# Phase 3 — ESRS extraction
+anthropic>=0.40        # phase3_esrs.py
+openai>=1.40           # phase3_local.py (Ollama / vLLM / Groq / OpenRouter)
+
+# recover_failed.py only (browser fallback for WAF-blocked reports)
+# playwright>=1.44

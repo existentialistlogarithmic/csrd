@@ -1,0 +1,8 @@
+# Phase 2b — local Hugging Face scoring (phase2b_hf.py).
+# Heavy (~2 GB with torch). Install on top of requirements.txt.
+-r requirements.txt
+
+torch>=2.2
+transformers>=4.40
+sentence-transformers>=3.0
+numpy>=1.24

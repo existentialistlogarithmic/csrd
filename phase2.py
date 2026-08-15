@@ -235,13 +235,21 @@ def process_file(txt_path: str, meta: dict):
 # _________________help
 
 def _stem_from_meta(row: dict) -> str:
-    """Reconstruct the filename stem that phase1 would have used."""
+    """Reconstruct the filename stem phase1 would have used.
+
+    Only a fallback for when a summary row's ``text_file`` path doesn't resolve
+    (e.g. the corpus was built on another machine). Must stay in step with
+    ``phase1.report_stem``.
+    """
     name = re.sub(r"[^\w\s-]", "", str(row.get("company", "")))
-    name = re.sub(r"\s+", "_", name.strip())
-    stem = f"{name}_{row.get('isin', '')}"
+    name = re.sub(r"\s+", "_", name.strip())[:80]
+    stem = f"{name}_{row.get('isin') or 'noisin'}"
     year = row.get("report_year", "")
     if str(year).strip() not in ("", "nan"):
         stem += f"_{int(float(year))}"
+    start, end = row.get("page_start", ""), row.get("page_end", "")
+    if str(start).strip() not in ("", "nan") and str(end).strip() not in ("", "nan"):
+        stem += f"_p{int(float(start))}-{int(float(end))}"
     return stem
 
 
