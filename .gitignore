@@ -28,5 +28,5 @@ esrs_output/
 esrs_coverage.csv
 esrs_failures.csv
 
-# full-corpus run log
-full_run.log
+# nohup logs from long background runs
+*_run.log
