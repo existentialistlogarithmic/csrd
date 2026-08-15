@@ -1,48 +1,94 @@
 #!/usr/bin/env python3
-# 1st stage
+"""Phase 1 — build the CSRD corpus: index -> download -> text + tables.
+
+Source of truth is the **live** SRN CSRD archive at
+https://www.srnav.com/reports?referrer=google-sheet (see srn_client.py), so the
+run always reflects what the site is publishing today rather than a spreadsheet
+snapshot. Every report comes with the page range of its sustainability
+statement, which is what makes this fast: a 125 MB annual report is parsed over
+its ~90 relevant pages instead of all 400.
+
+Speed comes from three places:
+  * downloads run in a thread pool, throttled **per host** rather than globally,
+    so ~1 500 distinct company web servers are hit concurrently while no single
+    server sees more than one request at a time;
+  * PDFs are streamed to disk, sniffed for the %PDF magic on the first chunk and
+    abandoned early if the server answers with an HTML error page;
+  * extraction runs in a process pool (PyMuPDF is CPU-bound and holds the GIL),
+    opening each document exactly once for text, tables and page count.
+
+About one link in seven does not hand over a PDF on a plain request, so a
+rejected download climbs a ladder of fallbacks before it is called a failure:
+the URL is repaired, the request is re-dressed (same-origin Referer, then a
+permissive Accept, then a full browser fingerprint with the host's own
+cookies), landing pages are mined for the real link, ZIP reporting packages are
+unpacked, and SRN's cached copy of the same URL is tried last. See the README
+for the resulting status vocabulary in download_log.csv.
+
+Everything is resumable: an already-downloaded, valid PDF is skipped, and so is
+a report whose text file is already newer than its PDF.
+
+    python3 phase1.py                       # full live corpus
+    python3 phase1.py --limit 20            # smoke test
+    python3 phase1.py --years 2025          # one fiscal year
+    python3 phase1.py --workers 24          # more download concurrency
+    python3 phase1.py --no-tables           # text only (roughly 3x faster)
+    python3 phase1.py --source excel        # legacy: links from the spreadsheet
+"""
+from __future__ import annotations
 
 import argparse
+import contextlib
 import csv
+import glob
+import io
 import json
 import logging
 import os
 import re
+import shutil
+import threading
 import time
+import zipfile
+from collections import Counter, defaultdict, deque
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from urllib.parse import parse_qs, unquote, urljoin, urlparse
 
-import fitz          # pip install pymupdf
 import pandas as pd
 import requests
-from urllib.parse import urljoin
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-from langdetect import detect, DetectorFactory, LangDetectException  # pip install langdetect
-DetectorFactory.seed = 0  # make detection deterministic
+try:                                  # PyMuPDF >= 1.24 prefers the new name
+    import pymupdf
+except ImportError:                   # pragma: no cover - older installs
+    import fitz as pymupdf
 
-# config
-EXCEL_FILE = "SRN-CSRD_report_archive.xlsx"
+from srn_client import USER_AGENT, fetch_csrd_reports, fetch_mirror_index, mirror_key
+
+# --- config ------------------------------------------------------------------
+
+EXCEL_GLOB = "SRN-CSRD_report_archive*.xlsx"
 SHEET_NAME = "csrd"
 HEADER_ROW = 2  # 0-indexed, so row 3 in the spreadsheet
-
-# SRN (Sustainability Reporting Navigator, srnav.com) API — hosts the report
-# PDFs itself, so downloads don't depend on 500 different company websites.
-# Endpoint variants are probed in order; the first that answers JSON wins.
-SRN_API_BASES = [
-    "https://api.srnav.com/api",
-    "https://www.srnav.com/api",
-    "https://api.sustainabilityreportingnavigator.com/api",
-]
 
 PDF_DIR = "pdfs"
 TEXT_DIR = "extracted_text"
 TABLE_DIR = "extracted_tables"
 DOWNLOAD_LOG = "download_log.csv"
 SUMMARY_CSV = "extraction_summary.csv"
+INDEX_CSV = "reports_index.csv"
 
-DELAY = 1.5      # seconds between downloads
-TIMEOUT = 60     # seconds per request
-MAX_RETRIES = 3  # retries for timeout/connection errors
-USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-              "AppleWebKit/537.36 (KHTML, like Gecko) "
-              "Chrome/124.0.0.0 Safari/537.36")
+DOWNLOAD_WORKERS = 12    # concurrent downloads across all hosts
+HOST_DELAY = 1.0         # min seconds between two requests to the same host
+TIMEOUT = (10, 60)       # (connect, read) seconds; read applies per chunk, and a
+                         # host that can't produce 256 KiB in a minute is dead
+MIN_PDF_BYTES = 10_000   # anything smaller is an error page, not a report
+PDF_SNIFF_BYTES = 1024   # the %PDF header must appear within this many bytes
+MAX_PDF_MB = 500         # refuse absurd payloads rather than fill the disk
+CHUNK = 1 << 18          # 256 KiB streaming chunks
+MAX_HTML_CANDIDATES = 4  # PDF links to try on a landing page
+MAX_REDIRECTS = 12       # redirect hops before calling it a loop
 
 logging.basicConfig(
     level=logging.INFO,
@@ -54,363 +100,639 @@ log = logging.getLogger(__name__)
 
 def clean_filename(name):
     """Remove special chars, replace spaces with underscores."""
-    name = re.sub(r"[^\w\s-]", "", name)
-    return re.sub(r"\s+", "_", name.strip())
+    name = re.sub(r"[^\w\s-]", "", str(name))
+    return re.sub(r"\s+", "_", name.strip())[:80]
 
 
-# 1 read thru excel n filter---
-
-def load_reports(path):
-    log.info("Reading %s ...", path)
-    df = pd.read_excel(path, sheet_name=SHEET_NAME, header=HEADER_ROW)
-
-    # some column names have newlines in them, clean that up
-    df.columns = [c.replace("\n", " ").strip() for c in df.columns]
-
-    # download everything that has a usable link; page ranges are optional
-    # (rows without start/end PDF get the whole document extracted)
-    mask = df["link"].astype(str).str.strip().str.startswith("http")
-    valid = df[mask].copy()
-
-    # keep start/end as nullable ints: NaN means "no page range given"
-    valid["start PDF"] = pd.to_numeric(valid["start PDF"], errors="coerce").astype("Int64")
-    valid["end PDF"] = pd.to_numeric(valid["end PDF"], errors="coerce").astype("Int64")
-    no_range = valid["start PDF"].isna() | valid["end PDF"].isna()
-
-    log.info("Total rows: %d | With link: %d (no page range: %d, will extract full document)",
-             len(df), len(valid), int(no_range.sum()))
-    return valid.reset_index(drop=True)
+def _usable(status):
+    """A download status that leaves a PDF on disk ('success:srn_mirror' too)."""
+    return str(status).startswith("success") or status == "skipped"
 
 
-# 1b SRN API source ---
-
-def _pick(d, *keys, default=None):
-    """First non-empty value among several possible key spellings."""
-    for k in keys:
-        v = d.get(k)
-        if v not in (None, ""):
-            return v
-    return default
+def _as_int(value):
+    try:
+        s = str(value).strip()
+        return int(float(s)) if s and s.lower() not in ("nan", "none", "<na>") else None
+    except (TypeError, ValueError):
+        return None
 
 
-def _srn_get_json(path):
-    """GET a JSON payload from the first SRN API base that answers."""
-    headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
-    for base in SRN_API_BASES:
-        url = base.rstrip("/") + path
-        resp = _fetch_with_retries(url, headers, max_retries=1)
-        if resp is None:
-            continue
-        try:
-            return resp.json(), base
-        except ValueError:
-            log.debug("Non-JSON response from %s", url)
-    return None, None
+# --- 1. index ----------------------------------------------------------------
 
-
-def _srn_items(payload):
-    """API may return a bare list or wrap it in data/items/results."""
-    if isinstance(payload, list):
-        return payload
-    if isinstance(payload, dict):
-        for k in ("data", "items", "results", "documents", "companies"):
-            if isinstance(payload.get(k), list):
-                return payload[k]
-    return []
-
-
-def load_reports_srn(years):
-    """Build the same dataframe shape as load_reports, but from the SRN API.
-
-    Every report gets a report_year; page ranges are unknown, so the full
-    document is extracted downstream."""
-    log.info("Querying SRN API for report documents (years: %s) ...",
-             ", ".join(str(y) for y in years))
-
-    companies_raw, base = _srn_get_json("/companies")
-    if companies_raw is None:
-        log.error("Could not reach any SRN API endpoint (%s). "
-                  "Check network access / endpoint list.", ", ".join(SRN_API_BASES))
-        return pd.DataFrame()
-    log.info("SRN API base: %s (%d companies)", base, len(_srn_items(companies_raw)))
-
-    companies = {}
-    for c in _srn_items(companies_raw):
-        cid = _pick(c, "id", "company_id", "uuid")
-        companies[cid] = {
-            "company": _pick(c, "name", "company", "company_name", default=""),
-            "isin": _pick(c, "isin", "ISIN", default=""),
-            "country": _pick(c, "country", "country_name", default=""),
-            "sector": _pick(c, "sector", "sics_sector", "SASB sector", default=""),
-            "industry": _pick(c, "industry", "sics_industry", "SASB industry", default=""),
-        }
-
-    docs_raw, _ = _srn_get_json("/documents")
-    docs = _srn_items(docs_raw) if docs_raw is not None else []
-    if not docs:
-        log.error("SRN API returned no documents.")
-        return pd.DataFrame()
-
-    types_seen = sorted({str(_pick(d, "type", "doc_type", "document_type", default="?"))
-                         for d in docs})
-    log.info("SRN document types seen: %s", ", ".join(types_seen))
-
+def load_reports_live(years=None):
+    """The live CSRD archive, normalised to one row per report."""
     rows = []
-    for d in docs:
-        year = _pick(d, "year", "fiscal_year", "reporting_year")
-        try:
-            year = int(str(year)[:4])
-        except (TypeError, ValueError):
+    for d in fetch_csrd_reports():
+        year = _as_int(d.get("year"))
+        if years and year not in years:
             continue
-        if year not in years:
-            continue
-        dtype = str(_pick(d, "type", "doc_type", "document_type", default="")).lower()
-        # keep annual/sustainability/CSRD reports, skip presentations etc.
-        if dtype and not any(t in dtype for t in ("ar", "annual", "sr", "sustain", "csrd", "report")):
-            continue
-        did = _pick(d, "id", "document_id", "uuid")
-        href = _pick(d, "href", "url", "download_url", "link",
-                     default=f"{base.rstrip('/')}/documents/{did}/download")
-        meta = companies.get(_pick(d, "company_id", "company", "companyId"), {})
+        company = d.get("company") or {}
         rows.append({
-            "company": meta.get("company") or _pick(d, "company_name", "name", default=str(did)),
-            "isin": meta.get("isin", ""),
-            "country": meta.get("country", ""),
-            "SASB industry": meta.get("industry", ""),
-            "SASB sector": meta.get("sector", ""),
-            "link": href,
-            "start PDF": pd.NA,
-            "end PDF": pd.NA,
+            "doc_id": d.get("id", ""),
+            "company": company.get("name") or "unknown",
+            "isin": company.get("isin") or "",
+            "lei": company.get("lei") or "",
+            "country": company.get("country") or "",
+            "SASB sector": company.get("sector") or "",
+            "SASB industry": company.get("industry") or "",
             "report_year": year,
+            "doc_type": d.get("type") or "",
+            "csrd_compliant": d.get("csrd_compliant") or "",
+            "csrd_report_number": d.get("csrd_report_number") or "",
+            "auditor": d.get("auditor") or "",
+            "publication_date": d.get("publication_date") or "",
+            "link": (d.get("original_link") or "").strip(),
+            "start PDF": _as_int(d.get("pdfpage_sust_start")),
+            "end PDF": _as_int(d.get("pdfpage_sust_end")),
         })
 
     df = pd.DataFrame(rows)
-    if not df.empty:
-        df["start PDF"] = df["start PDF"].astype("Int64")
-        df["end PDF"] = df["end PDF"].astype("Int64")
-        per_year = df["report_year"].value_counts().sort_index().to_dict()
-        log.info("SRN reports selected: %d (%s)", len(df),
-                 ", ".join(f"{y}: {n}" for y, n in per_year.items()))
+    if df.empty:
+        return df
+    # repair the malformed links in the archive here rather than at fetch time,
+    # so a typo'd scheme ("hhttps://") doesn't drop the row from the index
+    df["link"] = df["link"].map(clean_url)
+    df = df[df["link"].map(lambda u: "." in urlparse(u).netloc)].copy()
+    # the same PDF can back two rows (e.g. a combined 2024/2025 filing)
+    before = len(df)
+    df = df.drop_duplicates(subset=["link", "start PDF", "end PDF"]).reset_index(drop=True)
+    ranged = int((df["start PDF"].notna() & df["end PDF"].notna()).sum())
+    log.info("Live index: %d reports with a link (%d deduped), %d with a page range",
+             len(df), before - len(df), ranged)
+    log.info("  by year: %s", ", ".join(
+        f"{y}: {n}" for y, n in sorted(df["report_year"].value_counts().items())))
+    return df
+
+
+def load_reports_excel(path=None, years=None):
+    """Legacy source: links from a downloaded copy of the archive spreadsheet."""
+    if not path:
+        matches = sorted(glob.glob(EXCEL_GLOB))
+        if not matches:
+            raise SystemExit(f"No spreadsheet matching {EXCEL_GLOB} — use the default "
+                             f"--source live, or pass --excel-file")
+        path = matches[-1]
+    log.info("Reading %s ...", path)
+    df = pd.read_excel(path, sheet_name=SHEET_NAME, header=HEADER_ROW)
+    df.columns = [c.replace("\n", " ").strip() for c in df.columns]
+
+    df = df[df["link"].astype(str).str.strip().str.startswith("http")].copy()
+    df["link"] = df["link"].astype(str).str.strip()
+    df["start PDF"] = df["start PDF"].map(_as_int)
+    df["end PDF"] = df["end PDF"].map(_as_int)
+    if "report_year" not in df.columns:
+        for candidate in ("year", "Year", "fiscal year"):
+            if candidate in df.columns:
+                df["report_year"] = df[candidate].map(_as_int)
+                break
+        else:
+            df["report_year"] = None
+    if years:
+        df = df[df["report_year"].isin(years) | df["report_year"].isna()]
+    # the spreadsheet predates most of the live index's columns; fill the gaps
+    # so the rest of the pipeline sees one shape regardless of source
+    for col in ("doc_id", "lei", "doc_type", "csrd_compliant", "csrd_report_number",
+                "auditor", "publication_date", "country", "SASB sector", "SASB industry"):
+        if col not in df.columns:
+            df[col] = ""
+    log.info("Spreadsheet rows with a link: %d", len(df))
     return df.reset_index(drop=True)
 
 
-# 2 downloads pdfs ---
-def _fetch_with_retries(url, headers, timeout=TIMEOUT, max_retries=MAX_RETRIES):
-    """Fetch a URL with SSL fallback and retry on timeout/connection errors."""
-    last_err = None
-    for attempt in range(1, max_retries + 1):
-        for verify in (True, False):
-            try:
-                if not verify:
-                    import urllib3
-                    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-                    log.info("  Retrying without SSL (attempt %d/%d)...", attempt, max_retries)
-                resp = requests.get(url, headers=headers, timeout=timeout, verify=verify)
-                resp.raise_for_status()
-                return resp
-            except requests.exceptions.SSLError:
-                if verify:
-                    continue  # try again without SSL
-                log.error("  SSL error persists: %s", url)
-                return None
-            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
-                last_err = e
-                if verify:
-                    break  # no point retrying without SSL for timeout
-                break
-            except requests.RequestException as e:
-                log.error("  Download failed: %s", e)
-                return None
-        if attempt < max_retries:
-            wait = 2 ** attempt
-            log.info("  Timeout/connection error, retrying in %ds (attempt %d/%d)...",
-                     wait, attempt, max_retries)
-            time.sleep(wait)
-    log.error("  Download failed after %d retries: %s", max_retries, last_err)
-    return None
-
-
-def _find_pdf_link_in_html(html_bytes, base_url):
-    """Try to find a PDF download link in an HTML page."""
-    try:
-        html = html_bytes.decode("utf-8", errors="ignore")
-    except Exception:
-        return None
-    # look for links ending in .pdf (common pattern for report download pages)
-    pdf_links = re.findall(r'href=["\']([^"\']*\.pdf(?:\?[^"\']*)?)["\']', html, re.IGNORECASE)
-    if not pdf_links:
-        return None
-    # prefer links that look like annual/sustainability reports
-    report_keywords = ["annual", "report", "sustainability", "csrd", "esg"]
-    best = None
-    for link in pdf_links:
-        absolute = urljoin(base_url, link)
-        if any(kw in link.lower() for kw in report_keywords):
-            best = absolute
-            break
-    if best is None:
-        best = urljoin(base_url, pdf_links[0])
-    log.info("  Found PDF link in HTML page: %s", best)
-    return best
-
-
-def download_pdf(url, dest):
-    """Try to download a PDF. Returns a status string."""
-    if os.path.exists(dest):
-        log.info("  Already exists, skipping")
-        return "skipped"
-
-    headers = {"User-Agent": USER_AGENT}
-
-    resp = _fetch_with_retries(url, headers)
-    if resp is None:
-        return "error:download_failed"
-
-    data = resp.content
-    content_type = resp.headers.get("Content-Type", "").lower()
-
-    # check if it's actually a PDF
-    looks_like_pdf = "pdf" in content_type or "octet-stream" in content_type
-    starts_with_pdf = data[:4] == b"%PDF"
-
-    if not looks_like_pdf and not starts_with_pdf:
-        # if we got HTML, try to find a PDF link in the page
-        if "html" in content_type:
-            pdf_url = _find_pdf_link_in_html(data, url)
-            if pdf_url:
-                resp2 = _fetch_with_retries(pdf_url, headers)
-                if resp2 is not None:
-                    data2 = resp2.content
-                    ct2 = resp2.headers.get("Content-Type", "").lower()
-                    if "pdf" in ct2 or "octet-stream" in ct2 or data2[:4] == b"%PDF":
-                        data = data2
-                    else:
-                        log.warning("  Linked file is not a PDF either (%s): %s", ct2, pdf_url)
-                        return "not_pdf"
-                else:
-                    log.warning("  Could not download linked PDF: %s", pdf_url)
-                    return "not_pdf"
-            else:
-                log.warning("  Not a PDF (%s) and no PDF link found in page: %s", content_type, url)
-                return "not_pdf"
-        else:
-            log.warning("  Not a PDF (%s): %s", content_type, url)
-            return "not_pdf"
-
-    # save it
-    with open(dest, "wb") as f:
-        f.write(data)
-
-    # reject tiny files (probably error pages)
-    if os.path.getsize(dest) < 10_000:
-        log.warning("  Too small (%d bytes), removing", os.path.getsize(dest))
-        os.remove(dest)
-        return "error:file_too_small"
-
-    return "success"
-
-
 def report_stem(row):
-    """Filename stem for one report; includes the year when known so a
-    company's 2024 and 2025 reports don't overwrite each other."""
-    stem = f"{clean_filename(str(row['company']))}_{row['isin']}"
+    """Filename stem; the year keeps a company's 2024 and 2025 filings apart."""
+    stem = f"{clean_filename(row['company'])}_{row.get('isin') or 'noisin'}"
     year = row.get("report_year")
-    if year is not None and not pd.isna(year):
+    if year not in (None, "") and not pd.isna(year):
         stem += f"_{int(year)}"
+    start, end = _as_int(row.get("start PDF")), _as_int(row.get("end PDF"))
+    if start and end:
+        stem += f"_p{start}-{end}"
     return stem
 
 
-def download_all(df):
-    statuses = {}
+# --- 2. download -------------------------------------------------------------
+
+class HostThrottle:
+    """One in-flight request per host, spaced by at least ``delay`` seconds.
+
+    Politeness lives at the host level, not globally: hammering one company's
+    web server is rude, but 1 500 different servers in parallel is not.
+    """
+
+    def __init__(self, delay=HOST_DELAY):
+        self.delay = delay
+        self._locks = defaultdict(threading.Lock)
+        self._last = defaultdict(float)
+        self._guard = threading.Lock()
+
+    def lock_for(self, url):
+        host = (urlparse(url).hostname or "").lower()
+        with self._guard:
+            return host, self._locks[host]
+
+    def wait(self, host):
+        gap = self.delay - (time.monotonic() - self._last[host])
+        if gap > 0:
+            time.sleep(gap)
+
+    def done(self, host):
+        self._last[host] = time.monotonic()
+
+
+_thread_local = threading.local()
+
+
+def get_session():
+    """One pooled, retrying Session per worker thread."""
+    s = getattr(_thread_local, "session", None)
+    if s is None:
+        s = requests.Session()
+        s.headers.update({
+            "User-Agent": USER_AGENT,
+            # some CDNs (Akamai/Cloudflare) 403 requests that look non-browser
+            "Accept": "application/pdf,text/html;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        })
+        # Separate budgets on purpose. A 5xx is usually a blip worth three
+        # tries, but a read timeout means the host is hanging, and retrying
+        # that three times costs 3x60s per URL — serialised per host, that one
+        # setting is the difference between a tail of minutes and of an hour.
+        retry = Retry(total=4, connect=2, read=1, status=3,
+                      backoff_factor=1.0, backoff_max=20,
+                      status_forcelist=(408, 425, 429, 500, 502, 503, 504),
+                      allowed_methods=frozenset(["GET", "HEAD"]),
+                      respect_retry_after_header=True)
+        adapter = HTTPAdapter(max_retries=retry, pool_connections=32, pool_maxsize=32)
+        s.mount("https://", adapter)
+        s.mount("http://", adapter)
+        _thread_local.session = s
+    return s
+
+
+def _get(url, verify=True, headers=None):
+    """GET, following redirects by hand so a malformed hop can be repaired.
+
+    requests follows redirects internally and raises ``InvalidSchema`` the
+    moment a site answers with a typo'd ``Location`` (one issuer really does
+    send ``hhttps://``). Stepping through them here means the same repair that
+    cleans the archive's links also cleans the server's.
+    """
+    session = get_session()
+    for _ in range(MAX_REDIRECTS):
+        resp = session.get(url, timeout=TIMEOUT, stream=True, headers=headers,
+                           verify=verify, allow_redirects=False)
+        location = resp.headers.get("Location") if resp.is_redirect else None
+        if not location:
+            return resp
+        resp.close()
+        url = clean_url(urljoin(url, location))
+    raise requests.exceptions.TooManyRedirects(f"more than {MAX_REDIRECTS} redirects: {url}")
+
+
+def _origin(url):
+    parts = urlparse(url)
+    return f"{parts.scheme}://{parts.netloc}/"
+
+
+def _warm_host(url, verify=True):
+    """Visit a host's home page once per worker so its WAF sets its cookies.
+
+    Akamai/Cloudflare/Imperva commonly serve a PDF only to a session that has
+    already loaded a page on the same origin. Cheap: once per host per thread.
+    """
+    warmed = getattr(_thread_local, "warmed", None)
+    if warmed is None:
+        warmed = _thread_local.warmed = set()
+    host = urlparse(url).netloc
+    if host in warmed:
+        return
+    warmed.add(host)
+    try:
+        with _get(_origin(url), verify=verify, headers=BROWSER_HEADERS) as resp:
+            resp.raw.read(1, decode_content=True)
+    except requests.RequestException:
+        pass
+
+
+# Statuses that mean "not to a robot" rather than "gone", so they are worth
+# re-asking for with a better-dressed request. 418 is what a couple of
+# bot-detectors answer with instead of 403. A 404 is not here on purpose:
+# the file really is missing and re-asking just wastes the host's time.
+_RETRYABLE_STATUSES = (401, 403, 406, 409, 418, 429, 451)
+
+BROWSER_HEADERS = {
+    "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
+               "image/avif,image/webp,*/*;q=0.8"),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+}
+
+
+def _strategies(url):
+    """(name, extra headers, warm-the-host?) attempts, cheapest first."""
+    origin = _origin(url)
+    return [
+        ("plain", None, False),
+        # a WAF that rejects a bare PDF fetch usually accepts a same-origin click
+        ("referer", {"Referer": origin}, False),
+        # 406 is almost always our narrow Accept header being refused
+        ("any-accept", {"Accept": "*/*", "Referer": origin}, False),
+        # full browser fingerprint plus cookies from the host's own home page
+        ("browser", {**BROWSER_HEADERS, "Referer": origin}, True),
+    ]
+
+
+# Bot walls, recognised so they can be reported as what they are. The first
+# two need a real browser; the third needs a different IP. None of them can be
+# talked past with headers, so recognising one ends the escalation early.
+_CHALLENGE_MARKERS = (
+    ("cloudflare_challenge", ("just a moment", "cf-browser-verification",
+                              "cf_chl_", "challenge-platform", "cf-please-wait")),
+    ("imperva_challenge", ("incapsula", "_incapsula_resource", "imperva")),
+    ("akamai_denied", ("access denied", "reference #", "akamaighost")),
+)
+
+
+def _detect_challenge(resp):
+    """Name the bot wall behind a rejection, or None if it's an ordinary refusal."""
+    try:
+        body = _read_capped(resp, 8192).lower()
+    except requests.RequestException:
+        return None
+    server = resp.headers.get("Server", "").lower()
+    for name, markers in _CHALLENGE_MARKERS:
+        if any(m in body for m in markers):
+            return name
+    if "cloudflare" in server:
+        return "cloudflare_challenge"
+    return None
+
+
+def _get_tolerant(url, verify=True):
+    """GET, escalating through the strategies above while the server says no."""
+    resp = None
+    for name, headers, warm in _strategies(url):
+        if warm:
+            _warm_host(url, verify)
+        if resp is not None:
+            resp.close()
+        resp = _get(url, verify=verify, headers=headers)
+        if resp.status_code not in _RETRYABLE_STATUSES:
+            if name != "plain":
+                log.debug("  %s accepted via '%s'", url, name)
+            return resp
+        challenge = _detect_challenge(resp)
+        if challenge:
+            # a JS proof-of-work wall or an IP block: dressing the request up
+            # further cannot help, so stop spending requests on this host
+            resp.challenge = challenge
+            return resp
+    return resp
+
+
+def _read_capped(resp, limit):
+    """First ``limit`` bytes of a streamed body, decoded as text."""
+    buf = bytearray()
+    for chunk in resp.iter_content(CHUNK):
+        buf += chunk
+        if len(buf) >= limit:
+            break
+    return buf.decode(resp.encoding or "utf-8", errors="ignore")
+
+
+_REPORT_KEYWORDS = ("annual", "report", "sustainability", "csrd", "esg",
+                    "nachhaltig", "integrated", "universal", "rapport", "bericht")
+
+
+def _find_pdf_links_in_html(html, base_url):
+    """Candidate PDF URLs on a landing page, best first.
+
+    Report links hide in more than plain anchors: meta-refresh redirects, PDF
+    viewers in an ``<iframe>``/``<embed>``, and download buttons whose href has
+    no ``.pdf`` extension but says "download" instead.
+    """
+    found = []
+
+    meta = re.search(r'http-equiv=["\']refresh["\'][^>]*content=["\'][^"\']*url=([^"\'>]+)',
+                     html, re.IGNORECASE)
+    if meta:
+        found.append(meta.group(1).strip())
+
+    # href/src ending in .pdf (anchors, iframes, embeds, objects)
+    found += re.findall(r'(?:href|src|data)=["\']([^"\']*\.pdf(?:\?[^"\']*)?)["\']',
+                        html, re.IGNORECASE)
+    # extensionless download endpoints, e.g. /media/12345/download
+    found += re.findall(r'href=["\']([^"\']*/(?:download|getfile|dokument)[^"\']*)["\']',
+                        html, re.IGNORECASE)
+
+    ranked, seen = [], set()
+    for link in sorted(found, key=lambda l: 0 if any(k in l.lower() for k in _REPORT_KEYWORDS) else 1):
+        if link.lower().startswith(("javascript:", "mailto:", "#", "data:")):
+            continue
+        absolute = clean_url(urljoin(base_url, link))
+        if absolute not in seen:
+            seen.add(absolute)
+            ranked.append(absolute)
+    return ranked
+
+
+ZIP_MAGIC = b"PK\x03\x04"
+
+
+def _pdf_from_zip(zip_path, dest):
+    """Pull the report PDF out of a ZIP. Returns (bytes, error).
+
+    ESEF filings — common in Poland and the Baltics — are delivered as a zipped
+    reporting package. The PDF is usually in there next to the iXBRL, and it is
+    the largest member; a package that really is XHTML-only has no PDF at all.
+    """
+    try:
+        with zipfile.ZipFile(zip_path) as archive:
+            members = [m for m in archive.infolist()
+                       if m.filename.lower().endswith(".pdf") and not m.is_dir()]
+            if not members:
+                return 0, "zip_without_pdf"
+            best = max(members, key=lambda m: m.file_size)
+            if best.file_size > MAX_PDF_MB * 1024 * 1024:
+                return best.file_size, f"too_large_over_{MAX_PDF_MB}mb"
+            with archive.open(best) as src, open(dest, "wb") as out:
+                shutil.copyfileobj(src, out)
+    except (zipfile.BadZipFile, OSError, RuntimeError) as e:
+        return 0, f"bad_zip:{type(e).__name__}"
+    size = os.path.getsize(dest)
+    if size < MIN_PDF_BYTES:
+        os.remove(dest)
+        return size, "file_too_small"
+    return size, None
+
+
+def _stream_to_file(resp, dest):
+    """Write the body to ``dest`` via a .part file. Returns (bytes, error)."""
+    part = dest + ".part"
+    limit = MAX_PDF_MB * 1024 * 1024
+    total = 0
+    head, sniffed = b"", False
+    try:
+        with open(part, "wb") as f:
+            for chunk in resp.iter_content(CHUNK):
+                if not chunk:
+                    continue
+                if not sniffed:
+                    # the header sits in the first KB (the spec tolerates a
+                    # preamble); neither %PDF nor a ZIP there means an error
+                    # page, so bail before pulling the other 99 MB
+                    head += chunk[:PDF_SNIFF_BYTES]
+                    if len(head) >= PDF_SNIFF_BYTES:
+                        if not _looks_like_report(head):
+                            return 0, "not_pdf"
+                        sniffed = True
+                total += len(chunk)
+                if total > limit:
+                    return total, f"too_large_over_{MAX_PDF_MB}mb"
+                f.write(chunk)
+        if not _looks_like_report(head):
+            return total, "not_pdf"
+        if head.startswith(ZIP_MAGIC):
+            return _pdf_from_zip(part, dest)
+        if total < MIN_PDF_BYTES:
+            return total, "file_too_small"
+        os.replace(part, dest)
+        return total, None
+    finally:
+        if os.path.exists(part):
+            os.remove(part)
+
+
+def _looks_like_report(head):
+    return b"%PDF" in head or head.startswith(ZIP_MAGIC)
+
+
+def _valid_pdf_on_disk(path):
+    try:
+        if os.path.getsize(path) < MIN_PDF_BYTES:
+            return False
+        with open(path, "rb") as f:
+            return b"%PDF" in f.read(PDF_SNIFF_BYTES)
+    except OSError:
+        return False
+
+
+def clean_url(url):
+    """Repair the malformed links the archive occasionally carries.
+
+    Real examples: a doubled scheme prefix (``hhttps://``), a scheme-relative
+    link, stray whitespace, and google.com/url?...&url=<real> wrappers.
+    """
+    url = (url or "").strip().replace(" ", "%20")
+    url = re.sub(r"^h+(ttps?://)", r"h\1", url, flags=re.IGNORECASE)
+    if url.startswith("//"):
+        url = "https:" + url
+    elif not re.match(r"^https?://", url, re.IGNORECASE):
+        url = "https://" + url.lstrip("/")
+
+    parts = urlparse(url)
+    if parts.netloc.endswith("google.com") and parts.path == "/url":
+        query = parse_qs(parts.query)
+        target = query.get("url") or query.get("q")
+        if target:
+            return clean_url(unquote(target[0]))
+    return url
+
+
+def _try_url(url, dest, follow_html=True):
+    """One URL -> a PDF on disk. Returns (status, bytes, final_url).
+
+    ``follow_html`` is cleared on the recursive call so a landing page that
+    links to another landing page can't send us round in circles.
+    """
+    try:
+        resp = _get_tolerant(url)
+    except requests.exceptions.SSLError:
+        # a surprising number of IR sites have broken chains
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        resp = _get_tolerant(url, verify=False)
+
+    with resp:
+        final_url = resp.url
+        if resp.status_code >= 400:
+            wall = getattr(resp, "challenge", None)
+            return (f"error:{wall}" if wall else f"error:http_{resp.status_code}"), 0, final_url
+        is_html = "html" in resp.headers.get("Content-Type", "").lower()
+        if not is_html:
+            size, err = _stream_to_file(resp, dest)
+            if err != "not_pdf":
+                return (f"error:{err}" if err else "success"), size, final_url
+            # the Content-Type lied — some servers label an error page
+            # application/octet-stream. Fall through and read it as HTML.
+        if not follow_html:
+            return "not_pdf", 0, final_url
+        body = _read_capped(resp, 400_000) if is_html else None
+
+    if body is None:                      # mislabelled body, already consumed
+        with _get_tolerant(url) as retry_resp:
+            body = _read_capped(retry_resp, 400_000)
+    candidates = _find_pdf_links_in_html(body, final_url)
+
+    # a landing page: try its best few candidates rather than only the first,
+    # and don't let one dead candidate cost us the rest of them
+    for candidate in candidates[:MAX_HTML_CANDIDATES]:
+        try:
+            status, size, _ = _try_url(candidate, dest, follow_html=False)
+        except requests.RequestException:
+            continue
+        if status == "success":
+            return status, size, candidate
+    return ("not_pdf" if candidates else "html_no_pdf_link"), 0, final_url
+
+
+def download_one(url, dest, throttle, refresh=False, mirror_url=None):
+    """Fetch one report PDF, escalating through fallbacks until one works."""
+    if not refresh and _valid_pdf_on_disk(dest):
+        return "skipped", os.path.getsize(dest), url
+
+    url = clean_url(url)
+    host, lock = throttle.lock_for(url)
+    with lock:
+        throttle.wait(host)
+        try:
+            status, size, final = _try_url(url, dest)
+        except requests.exceptions.Timeout:
+            status, size, final = "error:timeout", 0, url
+        except requests.exceptions.RetryError as e:
+            status, size, final = "error:retries_exhausted", 0, url
+            log.debug("%s: %s", url, e)
+        except requests.exceptions.TooManyRedirects:
+            status, size, final = "error:redirect_loop", 0, url
+        except requests.exceptions.ConnectionError as e:
+            # A host that hangs up mid-handshake rather than answering is
+            # fingerprinting the TLS client, which no header can dress around —
+            # worth its own status so recover_failed.py can target those.
+            dropped = any(w in str(e) for w in
+                          ("RemoteDisconnected", "ConnectionResetError", "EOF occurred"))
+            status = "error:connection_dropped" if dropped else "error:connection"
+            size, final = 0, url
+        except requests.RequestException as e:
+            status, size, final = f"error:{type(e).__name__}", 0, url
+        finally:
+            throttle.done(host)
+
+    # last resort: SRN caches a copy of some reports and serves it from its own
+    # API, which sidesteps a dead company link or an IP-blocking WAF entirely
+    if not _usable(status) and mirror_url:
+        try:
+            m_status, m_size, m_final = _try_url(mirror_url, dest, follow_html=False)
+            if m_status == "success":
+                return "success:srn_mirror", m_size, m_final
+        except requests.RequestException:
+            pass
+    return status, size, final
+
+
+def _interleave_by_host(jobs):
+    """Round-robin the queue across hosts so workers rarely queue on one lock."""
+    buckets = defaultdict(deque)
+    for job in jobs:
+        buckets[(urlparse(job["url"]).hostname or "").lower()].append(job)
+    order, queues = [], list(buckets.values())
+    while queues:
+        queues = [q for q in queues if q]
+        for q in list(queues):
+            order.append(q.popleft())
+    return order
+
+
+def download_all(jobs, workers=DOWNLOAD_WORKERS, refresh=False, host_delay=HOST_DELAY):
+    """Download every job's PDF concurrently. Returns {stem: (status, bytes)}."""
+    throttle = HostThrottle(host_delay)
+    results = {}
+    started = time.monotonic()
     is_new = not os.path.exists(DOWNLOAD_LOG)
 
     with open(DOWNLOAD_LOG, "a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         if is_new:
-            writer.writerow(["index", "company", "isin", "url", "status", "dest"])
+            writer.writerow(["stem", "company", "isin", "url", "final_url",
+                             "status", "bytes", "dest"])
+        log_lock = threading.Lock()
 
-        for idx, row in df.iterrows():
-            company = str(row["company"])
-            isin = str(row["isin"])
-            url = str(row["link"])
-            dest = os.path.join(PDF_DIR, f"{report_stem(row)}.pdf")
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(download_one, job["url"], job["dest"], throttle,
+                            refresh, job.get("mirror")): job
+                for job in _interleave_by_host(jobs)
+            }
+            for n, future in enumerate(as_completed(futures), 1):
+                job = futures[future]
+                try:
+                    status, size, final_url = future.result()
+                except Exception as e:               # noqa: BLE001 - never kill the run
+                    status, size, final_url = f"error:{type(e).__name__}", 0, job["url"]
+                    log.debug("%s: %s", job["stem"], e)
+                results[job["stem"]] = (status, size)
 
-            log.info("[%d/%d] %s", idx + 1, len(df), company)
-            status = download_pdf(url, dest)
-            statuses[idx] = status
-            writer.writerow([idx, company, isin, url, status, dest])
-            f.flush()
+                with log_lock:
+                    writer.writerow([job["stem"], job["company"], job["isin"], job["url"],
+                                     final_url, status, size, job["dest"]])
+                    f.flush()
+                if status.startswith("success"):
+                    log.info("[%d/%d] %s (%.1f MB)", n, len(jobs), job["company"],
+                             size / 1e6)
+                elif status == "skipped":
+                    log.debug("[%d/%d] %s (cached)", n, len(jobs), job["company"])
+                else:
+                    log.warning("[%d/%d] %s -> %s", n, len(jobs), job["company"], status)
 
-            if status == "success":
-                log.info("  saved to %s", dest)
-            if status != "skipped":
-                time.sleep(DELAY)
-
-    return statuses
-
-
-# -3 get txt ffrom tables (this will return it bin...)
-
-def extract_text(pdf_path, start, end):
-    """Get text from pages start to end (1-indexed, inclusive).
-    start/end of None means the whole document."""
-    try:
-        doc = fitz.open(pdf_path)
-    except Exception as e:
-        log.error("  Can't open %s: %s", pdf_path, e)
-        return None
-
-    if start is None:
-        start = 1
-    if end is None:
-        end = len(doc)
-
-    pages = []
-    for p in range(start - 1, min(end, len(doc))):
-        # prefix each page with a [[page:N]] marker so downstream ESRS
-        # extraction (phase3) can cite page numbers; N is the 1-indexed PDF page
-        body = doc[p].get_text("text", flags=fitz.TEXT_PRESERVE_LIGATURES)
-        pages.append(f"[[page:{p + 1}]]\n{body}")
-    doc.close()
-    return "\n\n".join(pages)
+    elapsed = time.monotonic() - started
+    ok = sum(1 for s, _ in results.values() if _usable(s))
+    log.info("Downloads finished in %.1f min: %d/%d usable (%.1f reports/min)",
+             elapsed / 60, ok, len(jobs), len(jobs) / max(elapsed / 60, 1e-9))
+    return results
 
 
-def extract_tables(pdf_path, start, end):
-    """Find tables using pymupdf's built-in table finder."""
-    found = []
-    try:
-        doc = fitz.open(pdf_path)
-    except Exception:
-        return found
+# --- 3. extraction (text + tables) -------------------------------------------
 
-    if start is None:
-        start = 1
-    if end is None:
-        end = len(doc)
+# Function words per language — matched as whole words, not substrings, which
+# is the whole trick: "e" is Italian but also lives inside every English word.
+# Enough to separate the 20-odd languages in the archive without a native
+# dependency; langdetect is used instead whenever it is installed.
+_LANG_MARKERS = {
+    "en": "the and of to in for with that this are was our we is on as by which",
+    "de": "der die das und von zu für mit im den des ist auf sich nicht werden",
+    "fr": "le la les des et de pour dans que est aux sur par une nos être",
+    "nl": "de het een en van voor met dat is op zijn niet aan door worden",
+    "es": "el la los las de y para con que es en por una del sus",
+    "it": "il la le di e per con che sono del nel una degli anche",
+    "sv": "och att det som en av för med den till inte har vi är",
+    "da": "og at det som en af for med den til ikke har vi er",
+    "no": "og at det som en av for med den til ikke har vi er",
+    "fi": "ja on ei että se voi ovat myös kuin sen mutta oli sekä",
+    "pt": "de que os as do da para com uma não em pelo seu",
+    "pl": "i w z na do nie się jest oraz przez które lub dla",
+    "cs": "a v na se je že pro do od které nebo být jsou",
+    "el": "και το της των στο με για από που είναι στην τον",
+}
+_LANG_SETS = {lang: frozenset(words.split()) for lang, words in _LANG_MARKERS.items()}
 
-    for p in range(start - 1, min(end, len(doc))):
-        try:
-            for table in doc[p].find_tables().tables:
-                rows = table.extract()
-                if rows:
-                    # replace None cells with empty string
-                    cleaned = [
-                        [cell if cell is not None else "" for cell in row]
-                        for row in rows
-                    ]
-                    found.append(cleaned)
-        except Exception as e:
-            log.debug("Table extraction failed on page %d: %s", p + 1, e)
+try:
+    from langdetect import DetectorFactory, LangDetectException, detect as _langdetect
+    DetectorFactory.seed = 0
+except ImportError:                    # pragma: no cover - optional dependency
+    _langdetect = None
 
-    doc.close()
-    return found
-# up until here
 
 def detect_language(text):
-    """Detect the language of extracted text ('en', 'de', ...) or 'unknown'.
+    """'en', 'de', ... or 'unknown'.
 
-    Samples from the start, middle and end so a translated cover page
-    can't fool the detector."""
+    Samples the start, middle and end so a translated cover page can't fool the
+    detector. Falls back to stopword frequency when langdetect isn't installed —
+    which is also what makes this cheap enough to run on 2 000 reports.
+    """
     if not text or not text.strip():
         return "unknown"
     n = len(text)
@@ -418,190 +740,340 @@ def detect_language(text):
     if n > 12000:
         mid = n // 2
         sample += "\n" + text[mid:mid + 4000] + "\n" + text[-4000:]
-    try:
-        return detect(sample)
-    except LangDetectException:
+
+    if _langdetect is not None:
+        try:
+            return _langdetect(sample)
+        except LangDetectException:
+            return "unknown"
+
+    words = re.findall(r"[^\W\d_]+", sample.lower(), re.UNICODE)
+    if len(words) < 40:
         return "unknown"
+    counts = Counter(words)
+    total = len(words)
+    # share of the sample made up of each language's function words
+    scores = {lang: sum(counts[w] for w in markers) / total
+              for lang, markers in _LANG_SETS.items()}
+    lang, share = max(scores.items(), key=lambda kv: kv[1])
+    # a real match runs 15-30%; below 4% we are just seeing coincidences
+    return lang if share >= 0.04 else "unknown"
 
 
-def process_one_pdf(pdf_path, stem, start, end):
-    """Extract text + tables from one PDF. Returns a dict with metadata."""
+_WORD_CELL = re.compile(r"[^\W\d_]{4,}", re.UNICODE)
+
+
+def _useful_table(rows):
+    """Filter out the table finder's false positives.
+
+    ``find_tables`` reads chart axes and page furniture as grids, which produces
+    a lot of 4x4 blocks of bare tick labels. A real disclosure table has at
+    least one word in it, and more than one row and column.
+    """
+    if len(rows) < 2 or max(len(r) for r in rows) < 2:
+        return False
+    cells = [c for row in rows for c in row if c]
+    if len(cells) < 4:
+        return False
+    return any(_WORD_CELL.search(c) for c in cells)
+
+
+def extract_one(task):
+    """Text + tables for one PDF, with the table finder's stdout hints muted.
+
+    Runs in a worker process, so it takes and returns plain data only — and
+    since nothing here legitimately prints, swallowing stdout is safe.
+    """
+    with contextlib.redirect_stdout(io.StringIO()):
+        return _extract_one(task)
+
+
+def _extract_one(task):
+    """The document is opened **once** and each page is visited **once** for
+    both text and tables — the old two-pass version paid the render cost twice.
+    """
+    pdf_path = task["pdf_path"]
+    stem = task["stem"]
     result = {
-        "text_file": None,
-        "table_file": None,
-        "word_count": 0,
-        "pages_extracted": 0,
-        "tables_found": 0,
-        "language": "unknown",
-        "extraction_status": "success",
+        "stem": stem, "text_file": None, "table_file": None, "word_count": 0,
+        "pages_extracted": 0, "pdf_pages": 0, "tables_found": 0,
+        "language": "unknown", "extraction_status": "success", "error": "",
     }
 
-    # get the text
-    text = extract_text(pdf_path, start, end)
-    if text is None:
-        result["extraction_status"] = "failed"
+    try:
+        doc = pymupdf.open(pdf_path)
+    except Exception as e:                            # noqa: BLE001
+        result.update(extraction_status="failed", error=f"open: {e}")
         return result
 
-    # no. how many pages actually extracted
     try:
-        doc = fitz.open(pdf_path)
-        total_pages = doc.page_count
-        doc.close()
-    except Exception:
-        total_pages = end or 0
+        total = doc.page_count
+        result["pdf_pages"] = total
+        start = task["start"] or 1
+        end = task["end"] or total
+        # a page range from the archive can outrun a re-issued PDF
+        start = max(1, min(start, total))
+        end = max(start, min(end, total))
 
-    eff_start = start if start is not None else 1
-    eff_end = end if end is not None else total_pages
-    result["pages_extracted"] = max(0, min(eff_end, total_pages) - (eff_start - 1))
-    # count words on the marker-free text so [[page:N]] markers don't inflate it
+        chunks, tables = [], []
+        for p in range(start - 1, end):
+            page = doc[p]
+            # [[page:N]] markers let phase 3 cite the PDF page an answer came from
+            chunks.append(f"[[page:{p + 1}]]\n"
+                          + page.get_text("text", flags=pymupdf.TEXT_PRESERVE_LIGATURES))
+            if task["tables"]:
+                try:
+                    for table in page.find_tables().tables:
+                        rows = [[c if c is not None else "" for c in row]
+                                for row in table.extract()]
+                        if rows and (task["all_tables"] or _useful_table(rows)):
+                            tables.append({"page": p + 1, "rows": rows})
+                except Exception:                     # noqa: BLE001
+                    pass                              # a bad page shouldn't sink the doc
+    except Exception as e:                            # noqa: BLE001
+        doc.close()
+        result.update(extraction_status="failed", error=f"parse: {e}")
+        return result
+    doc.close()
+
+    text = "\n\n".join(chunks)
+    result["pages_extracted"] = end - start + 1
+    # count words on marker-free text so [[page:N]] doesn't inflate the total
     result["word_count"] = len(re.sub(r"\[\[page:\d+\]\]", " ", text).split())
     result["language"] = detect_language(text)
 
-    # save the text
-    text_file = os.path.join(TEXT_DIR, f"{stem}.txt")
+    text_file = os.path.join(task["text_dir"], f"{stem}.txt")
     with open(text_file, "w", encoding="utf-8") as f:
         f.write(text)
     result["text_file"] = text_file
 
-    # get tables and save them
-    tables = extract_tables(pdf_path, start, end)
     result["tables_found"] = len(tables)
     if tables:
-        table_file = os.path.join(TABLE_DIR, f"{stem}_tables.json")
+        table_file = os.path.join(task["table_dir"], f"{stem}_tables.json")
         with open(table_file, "w", encoding="utf-8") as f:
-            json.dump(tables, f, ensure_ascii=False, indent=2)
+            json.dump(tables, f, ensure_ascii=False)
         result["table_file"] = table_file
-
     return result
 
 
-# 4 summary
+def extract_all(tasks, workers):
+    """Run extraction across a process pool; returns {stem: result}."""
+    results = {}
+    if not tasks:
+        return results
+    started = time.monotonic()
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(extract_one, t): t for t in tasks}
+        for n, future in enumerate(as_completed(futures), 1):
+            task = futures[future]
+            try:
+                r = future.result()
+            except Exception as e:                    # noqa: BLE001
+                r = {"stem": task["stem"], "extraction_status": "failed",
+                     "error": str(e), "language": "unknown", "pages_extracted": 0,
+                     "word_count": 0, "tables_found": 0, "pdf_pages": 0,
+                     "text_file": None, "table_file": None}
+            results[r["stem"]] = r
+            if r["extraction_status"] == "success":
+                log.info("[%d/%d] %s — %d pages, %d words, %d tables, %s",
+                         n, len(tasks), r["stem"], r["pages_extracted"],
+                         r["word_count"], r["tables_found"], r["language"])
+            else:
+                log.warning("[%d/%d] %s — extraction failed: %s",
+                            n, len(tasks), r["stem"], r.get("error", ""))
+    log.info("Extraction finished in %.1f min (%d documents, %d workers)",
+             (time.monotonic() - started) / 60, len(tasks), workers)
+    return results
 
-def build_summary(df, download_statuses, extraction_results):
-    # find SASB column names (ok)
-    industry_col = ""
-    sector_col = ""
-    for c in df.columns:
-        if "SASB industry" in c:
-            industry_col = c
-        if "SASB sector" in c:
-            sector_col = c
 
+# --- 4. summary --------------------------------------------------------------
+
+def build_summary(df, downloads, extractions, path=SUMMARY_CSV):
     rows = []
-    for idx, row in df.iterrows():
-        ext = extraction_results.get(idx, {})
+    for _, row in df.iterrows():
+        stem = row["_stem"]
+        status, size = downloads.get(stem, ("not_attempted", 0))
+        ext = extractions.get(stem, {})
         rows.append({
-            "company": str(row["company"]),
-            "isin": str(row["isin"]),
+            "company": row["company"],
+            "isin": row.get("isin", ""),
             "report_year": row.get("report_year", ""),
             "country": row.get("country", ""),
-            "industry": row.get(industry_col, ""),
-            "sector": row.get(sector_col, ""),
-            "download_status": download_statuses.get(idx, "unknown"),
+            "industry": row.get("SASB industry", ""),
+            "sector": row.get("SASB sector", ""),
+            "doc_type": row.get("doc_type", ""),
+            "csrd_compliant": row.get("csrd_compliant", ""),
+            "auditor": row.get("auditor", ""),
+            "publication_date": row.get("publication_date", ""),
+            "page_start": row.get("start PDF") if pd.notna(row.get("start PDF")) else "",
+            "page_end": row.get("end PDF") if pd.notna(row.get("end PDF")) else "",
+            "source_url": row.get("link", ""),
+            "download_status": status,
+            "pdf_bytes": size,
             "extraction_status": ext.get("extraction_status", "not_attempted"),
             "language": ext.get("language", "unknown"),
+            "pdf_pages": ext.get("pdf_pages", 0),
             "pages_extracted": ext.get("pages_extracted", 0),
             "word_count": ext.get("word_count", 0),
             "tables_found": ext.get("tables_found", 0),
-            "text_file": ext.get("text_file", ""),
-            "table_file": ext.get("table_file", ""),
+            "text_file": ext.get("text_file") or "",
+            "table_file": ext.get("table_file") or "",
         })
+    out = pd.DataFrame(rows)
+    out.to_csv(path, index=False)
+    log.info("Summary saved to %s (%d rows)", path, len(out))
+    return out
 
-    pd.DataFrame(rows).to_csv(SUMMARY_CSV, index=False)
-    log.info("Summary saved to %s (%d rows)", SUMMARY_CSV, len(rows))
+
+def report_totals(summary):
+    dl = summary["download_status"].map(
+        lambda s: "ok" if _usable(s) else "failed").value_counts()
+    log.info("Downloads : %d ok, %d failed", dl.get("ok", 0), dl.get("failed", 0))
+    ex = summary["extraction_status"].value_counts()
+    log.info("Extraction: %s", ", ".join(f"{k}={v}" for k, v in ex.items()))
+    done = summary[summary["extraction_status"] == "success"]
+    if not done.empty:
+        log.info("Corpus    : %s words over %s pages, %s tables",
+                 f"{int(done['word_count'].sum()):,}",
+                 f"{int(done['pages_extracted'].sum()):,}",
+                 f"{int(done['tables_found'].sum()):,}")
+        langs = done["language"].value_counts().head(6)
+        log.info("Languages : %s", ", ".join(f"{k}={v}" for k, v in langs.items()))
+        failed = summary[~summary["download_status"].map(_usable)]
+        if not failed.empty:
+            top = failed["download_status"].value_counts().head(5)
+            log.info("Top download failures: %s",
+                     ", ".join(f"{k}={v}" for k, v in top.items()))
 
 
-# main
+# --- main --------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="CSRD PDF scraping pipeline")
-    parser.add_argument("--source", choices=["excel", "srn"], default="excel",
-                        help="excel: links from the SRN archive spreadsheet; "
-                             "srn: report list + PDFs from the SRN API (srnav.com)")
-    parser.add_argument("--years", default="2024,2025",
-                        help="Fiscal years to fetch with --source srn (comma-separated)")
-    parser.add_argument("--excel-file", default=EXCEL_FILE, help="Input Excel file")
-    parser.add_argument("--limit", type=int, help="Only process first N reports")
-    parser.add_argument("--start-from", type=int, default=0, help="Resume from this index")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser(description="CSRD phase 1 — download and parse the corpus")
+    ap.add_argument("--source", choices=["live", "excel"], default="live",
+                    help="live: srnav.com/reports (default); excel: archive spreadsheet")
+    ap.add_argument("--excel-file", help=f"Spreadsheet for --source excel (default: {EXCEL_GLOB})")
+    ap.add_argument("--years", default="2024,2025",
+                    help="Fiscal years to keep, comma-separated ('all' for every year)")
+    ap.add_argument("--limit", type=int, help="Only process the first N reports")
+    ap.add_argument("--start-from", type=int, default=0, help="Skip the first N reports")
+    ap.add_argument("--workers", type=int, default=DOWNLOAD_WORKERS,
+                    help="Concurrent downloads")
+    ap.add_argument("--extract-workers", type=int, default=max(1, (os.cpu_count() or 2)),
+                    help="Extraction processes (default: CPU count)")
+    ap.add_argument("--host-delay", type=float, default=HOST_DELAY,
+                    help="Min seconds between requests to the same host")
+    ap.add_argument("--no-tables", action="store_true", help="Skip table detection")
+    ap.add_argument("--all-tables", action="store_true",
+                    help="Keep every detected table, including chart-axis false positives")
+    ap.add_argument("--full-pages", action="store_true",
+                    help="Extract whole documents, ignoring the sustainability page range")
+    ap.add_argument("--no-mirror", action="store_true",
+                    help="Don't fall back to SRN's cached copy when a company link fails")
+    ap.add_argument("--refresh", action="store_true", help="Re-download PDFs already on disk")
+    ap.add_argument("--re-extract", action="store_true",
+                    help="Re-parse PDFs whose text file already exists")
+    ap.add_argument("--skip-download", action="store_true",
+                    help="Only extract from PDFs already in pdfs/")
+    args = ap.parse_args()
 
-    # create output folders
-    for d in [PDF_DIR, TEXT_DIR, TABLE_DIR]:
+    for d in (PDF_DIR, TEXT_DIR, TABLE_DIR):
         os.makedirs(d, exist_ok=True)
 
-    # load and filter
-    if args.source == "srn":
+    years = None
+    if args.years.strip().lower() != "all":
         years = {int(y) for y in args.years.split(",") if y.strip()}
-        df = load_reports_srn(years)
-    else:
-        df = load_reports(args.excel_file)
 
-    if args.start_from > 0:
-        df = df.iloc[args.start_from:]
-        log.info("Starting from index %d (%d left)", args.start_from, len(df))
-    if args.limit is not None:
-        df = df.iloc[:args.limit]
-        log.info("Limiting to %d reports", len(df))
-    # reset index after slicing so download_all and extraction loop use 0-based indices
-    df = df.reset_index(drop=True)
+    # 1. index
+    log.info("=" * 60)
+    log.info("STEP 1: Building the report index (source: %s)", args.source)
+    log.info("=" * 60)
+    df = (load_reports_live(years) if args.source == "live"
+          else load_reports_excel(args.excel_file, years))
     if df.empty:
-        log.warning("Nothing to process.")
+        log.error("No reports to process.")
         return
 
-    # download
-    log.info("=" * 50)
-    log.info("STEP 2: Downloading PDFs")
-    log.info("=" * 50)
-    download_statuses = download_all(df)
+    if args.start_from:
+        df = df.iloc[args.start_from:]
+    if args.limit is not None:
+        df = df.iloc[:args.limit]
+    df = df.reset_index(drop=True)
+    df["_stem"] = [report_stem(r) for _, r in df.iterrows()]
+    # two rows can still collide on the stem (same company, year and range)
+    df = df.drop_duplicates(subset=["_stem"]).reset_index(drop=True)
+    df.drop(columns=["_stem"]).to_csv(INDEX_CSV, index=False)
+    log.info("Processing %d reports (index written to %s)", len(df), INDEX_CSV)
 
-    # extract
-    log.info("=" * 50)
-    log.info("STEP 3: Extracting text and tables")
-    log.info("=" * 50)
-    extraction_results = {}
+    # 2. download
+    log.info("=" * 60)
+    log.info("STEP 2: Downloading PDFs (%d workers, %.1fs per host)",
+             args.workers, args.host_delay)
+    log.info("=" * 60)
+    mirrors = {} if args.no_mirror else fetch_mirror_index()
+    jobs = [{"stem": r["_stem"], "company": r["company"], "isin": r.get("isin", ""),
+             "url": r["link"], "dest": os.path.join(PDF_DIR, f"{r['_stem']}.pdf"),
+             "mirror": mirrors.get(mirror_key(r["link"]))}
+            for _, r in df.iterrows()]
+    if args.skip_download:
+        downloads = {j["stem"]: (("skipped", os.path.getsize(j["dest"]))
+                                 if _valid_pdf_on_disk(j["dest"])
+                                 else ("error:missing", 0)) for j in jobs}
+        log.info("Skipping downloads; %d PDFs already on disk",
+                 sum(1 for s, _ in downloads.values() if s == "skipped"))
+    else:
+        downloads = download_all(jobs, args.workers, args.refresh, args.host_delay)
 
-    for idx, row in df.iterrows():
-        company = str(row["company"])
-        stem = report_stem(row)
+    # 3. extract
+    log.info("=" * 60)
+    log.info("STEP 3: Extracting text%s (%d processes)",
+             "" if args.no_tables else " and tables", args.extract_workers)
+    log.info("=" * 60)
+    tasks, cached = [], {}
+    for _, row in df.iterrows():
+        stem = row["_stem"]
+        if not _usable(downloads.get(stem, ("", 0))[0]):
+            continue
         pdf_path = os.path.join(PDF_DIR, f"{stem}.pdf")
-        start = None if pd.isna(row["start PDF"]) else int(row["start PDF"])
-        end = None if pd.isna(row["end PDF"]) else int(row["end PDF"])
-
-        status = download_statuses.get(idx, "unknown")
-        if status not in ("success", "skipped"):
-            log.info("[%d/%d] Skipping %s (download: %s)", idx+1, len(df), company, status)
-            continue
         if not os.path.exists(pdf_path):
-            log.warning("[%d/%d] PDF missing: %s", idx+1, len(df), company)
             continue
+        text_path = os.path.join(TEXT_DIR, f"{stem}.txt")
+        if not args.re_extract and os.path.exists(text_path) \
+                and os.path.getmtime(text_path) >= os.path.getmtime(pdf_path):
+            table_path = os.path.join(TABLE_DIR, f"{stem}_tables.json")
+            body = open(text_path, encoding="utf-8").read()
+            n_tables = 0
+            if os.path.exists(table_path):
+                with open(table_path, encoding="utf-8") as f:
+                    n_tables = len(json.load(f))
+            cached[stem] = {
+                "stem": stem, "extraction_status": "success", "error": "",
+                "language": detect_language(body),
+                "pages_extracted": body.count("[[page:"),
+                "pdf_pages": 0,
+                "word_count": len(re.sub(r"\[\[page:\d+\]\]", " ", body).split()),
+                "tables_found": n_tables, "text_file": text_path,
+                "table_file": table_path if n_tables else None,
+            }
+            continue
+        tasks.append({
+            "pdf_path": pdf_path, "stem": stem,
+            "start": None if args.full_pages else _as_int(row.get("start PDF")),
+            "end": None if args.full_pages else _as_int(row.get("end PDF")),
+            "tables": not args.no_tables, "all_tables": args.all_tables,
+            "text_dir": TEXT_DIR, "table_dir": TABLE_DIR,
+        })
+    if cached:
+        log.info("%d document(s) already parsed, reusing", len(cached))
+    extractions = extract_all(tasks, args.extract_workers)
+    extractions.update(cached)
 
-        if start is not None and end is not None:
-            log.info("[%d/%d] Extracting %s (pages %d-%d)", idx+1, len(df), company, start, end)
-        else:
-            log.info("[%d/%d] Extracting %s (full document)", idx+1, len(df), company)
-        extraction_results[idx] = process_one_pdf(pdf_path, stem, start, end)
-        r = extraction_results[idx]
-        log.info("  %d pages, %d words, %d tables, language: %s",
-                 r["pages_extracted"], r["word_count"], r["tables_found"], r["language"])
-
-    # summary
-    log.info("=" * 50)
-    log.info("STEP 4: Building summary")
-    log.info("=" * 50)
-    build_summary(df, download_statuses, extraction_results)
-
-    # final count
-    success_count = 0
-    skip_count = 0
-    fail_count = 0
-    for s in download_statuses.values():
-        if s == "success":
-            success_count += 1
-        elif s == "skipped":
-            skip_count += 1
-        else:
-            fail_count += 1
-    log.info("Done! success: %d, skipped: %d, failed: %d", success_count, skip_count, fail_count)
+    # 4. summary
+    log.info("=" * 60)
+    log.info("STEP 4: Summary")
+    log.info("=" * 60)
+    summary = build_summary(df, downloads, extractions)
+    report_totals(summary)
 
 
 if __name__ == "__main__":

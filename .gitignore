@@ -1,25 +1,29 @@
-# output directories ( phase1.py)
+# phase1 output directories
 pdfs/
 extracted_text/
 extracted_tables/
 
-# rntime logs and summaries (regen on each run)
+# phase1 runtime logs and summaries (regenerated on each run)
+reports_index.csv
 download_log.csv
 extraction_summary.csv
+recover_log.csv
 
-# pyth
+# python
 __pycache__/
 *.pyc
+.venv/
+venv/
 
-# phase2 outputs (regen on each run)
+# phase2 outputs (regenerated on each run)
 nlp_results.csv
 nlp_output/
 
-# phase3 outputs (regen on each run)
+# phase2b outputs (regenerated on each run)
+hf_output/
+hf_esg_scores.csv
+
+# phase3 outputs (regenerated on each run)
 esrs_output/
 esrs_coverage.csv
 esrs_failures.csv
-
-# phase2b outputs (regen on each run)
-hf_output/
-hf_esg_scores.csv

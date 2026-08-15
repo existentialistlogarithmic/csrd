@@ -14,13 +14,13 @@ SETUP (VS Code terminal)
     playwright install chromium          # one-time browser download
 
     # Put this file in the same folder as:
-    #   - failed_downloads_124.csv   (the worklist you were sent)
+    #   - download_log.csv            (written by phase1.py; failures are picked out of it)
     #   - pdfs/                       (existing folder; recovered PDFs land here)
     # If pdfs/ doesn't exist locally, it will be created.
 
     python recover_failed.py                 # requests + browser fallback
     python recover_failed.py --no-browser    # requests only (faster, weaker)
-    python recover_failed.py --only 403_WAF_ip_block   # one reason category
+    python recover_failed.py --only error:http_403     # one failure category
 ------------------------------------------------------------------------------
 
 Output:
@@ -28,7 +28,7 @@ Output:
     recover_log.csv             one row per attempt (recovered / still_failed)
 
 After running, copy the new pdfs/ back next to phase1.py and run:
-    python3 phase1.py --retry-failed
+    python3 phase1.py --skip-download
 to extract text/tables + detect language for the newly recovered PDFs.
 """
 
@@ -45,7 +45,7 @@ import requests
 # ----------------------------------------------------------------------------
 # config
 # ----------------------------------------------------------------------------
-FAILED_CSV = "failed_downloads_124.csv"
+FAILED_CSV = "download_log.csv"   # phase1.py writes this; failures are filtered out of it
 PDF_DIR = "pdfs"
 RECOVER_LOG = "recover_log.csv"
 TIMEOUT = 60
@@ -107,7 +107,6 @@ def find_pdf_links_in_html(html, base_url):
 # strategy 1: plain requests (with SSL fallback + retries + HTML link follow)
 # ----------------------------------------------------------------------------
 def fetch(url, timeout=TIMEOUT, retries=MAX_RETRIES):
-    last = None
     for attempt in range(1, retries + 1):
         for verify in (True, False):
             try:
@@ -121,11 +120,9 @@ def fetch(url, timeout=TIMEOUT, retries=MAX_RETRIES):
                 if verify:
                     continue
                 return None
-            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
-                last = e
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
                 break
-            except requests.RequestException as e:
-                last = e
+            except requests.RequestException:
                 return None
         if attempt < retries:
             time.sleep(2 ** attempt)
@@ -207,24 +204,33 @@ def main():
     ap.add_argument("--csv", default=FAILED_CSV)
     ap.add_argument("--no-browser", action="store_true",
                     help="skip the Playwright fallback (requests only)")
-    ap.add_argument("--only", help="only rows whose reason == this value")
+    ap.add_argument("--only", help="only rows with this failure status, e.g. error:http_403")
     ap.add_argument("--limit", type=int)
     args = ap.parse_args()
 
     if not os.path.exists(args.csv):
-        sys.exit(f"missing {args.csv} — put it next to this script")
+        sys.exit(f"missing {args.csv} — run phase1.py first, or pass --csv")
     os.makedirs(PDF_DIR, exist_ok=True)
 
     df = pd.read_csv(args.csv)
+    # phase1's download_log.csv carries every attempt; keep only the failures.
+    # "reason" is the column name the old standalone worklist used.
+    if "reason" not in df.columns and "status" in df.columns:
+        df = df[~df["status"].isin(["success", "skipped"])].copy()
+        df["reason"] = df["status"]
+    df = df.drop_duplicates(subset=["url"])
     if args.only:
         df = df[df["reason"] == args.only]
     if args.limit:
         df = df.head(args.limit)
+    if df.empty:
+        print(f"Nothing to recover from {args.csv}.")
+        return
 
     rows, ok = [], 0
     for i, row in df.reset_index(drop=True).iterrows():
         company, url = str(row["company"]), str(row["url"])
-        dest = row.get("expected_file") or os.path.join(
+        dest = row.get("dest") or row.get("expected_file") or os.path.join(
             PDF_DIR, re.sub(r"\s+", "_", re.sub(r"[^\w\s-]", "", company)) + f"_{row['isin']}.pdf")
         print(f"[{i+1}/{len(df)}] {company} ({row.get('reason','?')})")
 
@@ -250,7 +256,7 @@ def main():
     pd.DataFrame(rows, columns=["company", "url", "result", "dest"]).to_csv(RECOVER_LOG, index=False)
     print(f"\nDone. Recovered {ok}/{len(df)}. Log: {RECOVER_LOG}")
     print(f"PDFs are in {PDF_DIR}/ — copy them next to phase1.py and run: "
-          f"python3 phase1.py --retry-failed")
+          f"python3 phase1.py --skip-download")
 
 
 if __name__ == "__main__":

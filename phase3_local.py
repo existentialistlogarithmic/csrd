@@ -34,16 +34,13 @@ import argparse
 import json
 import logging
 import os
-import re
-import time
 
-import pandas as pd
-
-# reuse the report selection, prompt loading, JSON parsing and coverage
+# reuse the report selection, prompt loading, JSON parsing, chunking, merging
+# and coverage flattening — only the model backend differs from phase3_esrs
 from phase3_esrs import (
-    load_prompt, robust_json, flatten, select_reports, read_text,
-    STATUSES, ESRS2_CODES, OUT_CSV, FAIL_CSV, PROMPT_FILE, SUMMARY_CSV,
-    TEXT_DIR, OUT_DIR,
+    chunk_text, flatten, load_prompt, merge_results, read_text, robust_json,
+    select_reports, write_outputs,
+    FAIL_CSV, OUT_CSV, OUT_DIR, PROMPT_FILE, SUMMARY_CSV, TEXT_DIR,
 )
 
 # provider -> (base_url, api-key env var, dummy key when the server needs none)
@@ -80,63 +77,6 @@ def make_client(args):
         log.error("%s requires an API key: set $%s or pass --api-key", args.provider, key_env)
         raise SystemExit(1)
     return OpenAI(base_url=base_url, api_key=api_key)
-
-
-def chunk_text(text, max_chars):
-    """Split on [[page:N]] markers, greedily packing chunks under max_chars,
-    so long reports fit small-context local models. Returns [text] if it fits."""
-    if max_chars <= 0 or len(text) <= max_chars:
-        return [text]
-    parts = re.split(r"(?=\[\[page:\d+\]\])", text)
-    chunks, cur = [], ""
-    for p in parts:
-        if cur and len(cur) + len(p) > max_chars:
-            chunks.append(cur)
-            cur = p
-        else:
-            cur += p
-    if cur:
-        chunks.append(cur)
-    return chunks
-
-
-def merge_results(parts):
-    """Merge per-chunk results per the prompt's USAGE note: union the disclosures
-    (best confidence per DR wins), keep meta/materiality from the chunk that
-    carries the materiality assessment, then recompute the coverage summary."""
-    if len(parts) == 1:
-        return parts[0]
-    merged = {"document_meta": {}, "materiality_assessment": {}, "disclosures": [], "coverage_summary": {}}
-    best, extras = {}, []
-    for r in parts:
-        ma = r.get("materiality_assessment") or {}
-        if ma.get("material_topics") and not merged["materiality_assessment"].get("material_topics"):
-            merged["materiality_assessment"] = ma
-            merged["document_meta"] = r.get("document_meta") or {}
-        for d in (r.get("disclosures") or []):
-            code = d.get("dr_code")
-            if not code:
-                extras.append(d)
-                continue
-            cur = best.get(code)
-            if cur is None or (d.get("confidence") or 0) > (cur.get("confidence") or 0):
-                best[code] = d
-    if not merged["document_meta"]:
-        merged["document_meta"] = parts[0].get("document_meta", {})
-    if not merged["materiality_assessment"]:
-        merged["materiality_assessment"] = parts[0].get("materiality_assessment", {})
-    merged["disclosures"] = list(best.values()) + extras
-    reported = [d for d in merged["disclosures"] if d.get("status") == "reported"]
-    merged["coverage_summary"] = {
-        "esrs2_complete": ESRS2_CODES.issubset(
-            {d.get("dr_code") for d in reported if d.get("dr_code") in ESRS2_CODES}),
-        "material_drs_reported": len(reported),
-        "material_drs_missing": sum(1 for d in merged["disclosures"]
-                                    if d.get("status") == "material_not_reported"),
-        "phase_ins_invoked": [d.get("dr_code") for d in merged["disclosures"]
-                              if d.get("status") == "phase_in_deferred"],
-    }
-    return merged
 
 
 def call_model(client, model, prompt, report_text, use_json_mode=True):
@@ -219,19 +159,7 @@ def main():
         log.info("  %d disclosures, %s material DRs reported",
                  len(result.get("disclosures", [])), cov.get("material_drs_reported", "?"))
 
-    if rows:
-        header = not os.path.exists(args.out_csv)
-        pd.DataFrame(rows).to_csv(args.out_csv, mode="a", header=header, index=False)
-        log.info("Coverage summary: %d rows -> %s", len(rows), args.out_csv)
-        df = pd.DataFrame(rows)
-        log.info("--- ESRS coverage across %d reports ---", len(df))
-        for st in STATUSES:
-            col = f"n_{st}"
-            if col in df:
-                log.info("  avg %-22s %.1f per report", st, df[col].mean())
-    if failures:
-        pd.DataFrame(failures).to_csv(FAIL_CSV, index=False)
-        log.warning("%d report(s) failed -> %s", len(failures), FAIL_CSV)
+    write_outputs(rows, failures, args.out_csv, FAIL_CSV)
 
 
 if __name__ == "__main__":
