@@ -70,18 +70,81 @@ Everything is resumable. A valid PDF already on disk is not re-downloaded, and a
 text file newer than its PDF is not re-parsed. Use `--refresh` / `--re-extract`
 to force either, and `--skip-download` to parse what's already in `pdfs/`.
 
-Downloads are streamed to a `.part` file and checked for the `%PDF` magic on the
-first chunk, so an HTML error page is abandoned before it costs bandwidth. A
-401/403 is retried once with a same-origin `Referer`, which gets past most of the
-WAFs. Expect a residual few per cent of failures from IP-blocking datacenter
-ranges — `recover_failed.py` retries those from a normal network with a real
-browser:
+### How failed downloads are handled
+
+Roughly one link in seven does not hand over a PDF on the first plain request.
+Phase 1 works through a ladder of fallbacks before giving up on one:
+
+1. **The link is repaired first.** The archive carries a few malformed URLs —
+   a doubled scheme (`hhttps://`), scheme-relative links, `google.com/url?…`
+   wrappers, stray spaces. `clean_url` fixes those at index time, so they never
+   reach the network broken.
+2. **A rejected request is re-dressed and re-asked**, cheapest first: a
+   same-origin `Referer`, then `Accept: */*` (which is what a 406 is really
+   complaining about), then a full browser header set with cookies picked up
+   from the host's own home page. Only statuses that mean *"not to a robot"*
+   escalate — 401, 403, 406, 409, 418, 429, 451. A 404 does not: the file is
+   genuinely missing and re-asking only wastes the host's time.
+3. **Landing pages are mined for the real link.** Up to four candidates per
+   page, ranked, drawn from anchors, `<iframe>`/`<embed>` sources, meta-refresh
+   redirects, and extensionless `/download` endpoints.
+4. **ZIP payloads are unpacked.** ESEF reporting packages — normal in Poland
+   and the Baltics — arrive as a zipped bundle; the report PDF is pulled out of
+   the archive.
+5. **SRN's own cached copy is the last resort.** Where SRN has cached the exact
+   same URL, `/api/documents/{id}/download` serves it, which sidesteps a dead
+   company link entirely. Matched on the **source URL**, never on
+   company-and-year: the page ranges are measured against one specific file, and
+   a same-company-same-year guess could silently extract the wrong pages.
+   Those rows are marked `success:srn_mirror` in `download_log.csv`. Disable
+   with `--no-mirror`.
+
+Measured over all 1,989 links in the live archive, a plain request gets 1,704
+of them (85.7%). The ladder above recovers 41 more of the 285 failures — most
+of the ZIP packages (7 of 10), 20 of the 55 landing pages, both 406s, both
+418s, and a handful of WAFs — for 1,745 (87.7%).
+
+What remains is mostly not a code problem. 93 of the 244 are bot walls
+(Cloudflare's JS challenge and Akamai IP denials), 59 are reports genuinely
+withdrawn from the company site, and 31 are landing pages that build their
+download link in JavaScript. `recover_failed.py` retries exactly those from a
+normal network with a real browser:
 
 ```bash
 pip install playwright && playwright install chromium
 python recover_failed.py                        # reads download_log.csv
 python recover_failed.py --only error:http_403  # one failure category
 python3 phase1.py --skip-download               # then parse what it recovered
+```
+
+`download_log.csv` records one row per attempt with the status vocabulary:
+
+| status | meaning |
+| --- | --- |
+| `success` | PDF downloaded from the company link |
+| `success:srn_mirror` | served from SRN's cached copy after the company link failed |
+| `skipped` | a valid PDF was already on disk |
+| `error:http_<code>` | the server refused, after the full escalation ladder |
+| `not_pdf` / `html_no_pdf_link` | a page, not a report, and no usable link on it |
+| `error:zip_without_pdf` | an ESEF package containing only XHTML/iXBRL |
+| `error:cloudflare_challenge` | a "Just a moment…" JS proof-of-work wall |
+| `error:imperva_challenge` | an Incapsula/Imperva interstitial |
+| `error:akamai_denied` | Akamai refusing the client's IP range outright |
+| `error:timeout` / `error:connection` | the host never answered |
+| `error:connection_dropped` | the host hung up mid-handshake — TLS fingerprinting |
+| `error:retries_exhausted` | repeated 5xx/429 through the retry budget |
+
+The last five are the categories no amount of header work can fix, and they are
+reported as what they are rather than as a generic 403 so you can act on them.
+A JS challenge has to be executed, not negotiated; a TLS fingerprint block dies
+before a single HTTP header is sent; an IP-range denial needs a different IP.
+Recognising a wall also ends the escalation early instead of spending three
+more requests on a host that has already made up its mind. All of them go to
+the browser path:
+
+```bash
+python recover_failed.py --only error:cloudflare_challenge
+python recover_failed.py --only error:connection_dropped
 ```
 
 ### Phase 2 — keyword ESG analysis

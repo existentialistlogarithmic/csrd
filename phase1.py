@@ -17,6 +17,14 @@ Speed comes from three places:
   * extraction runs in a process pool (PyMuPDF is CPU-bound and holds the GIL),
     opening each document exactly once for text, tables and page count.
 
+About one link in seven does not hand over a PDF on a plain request, so a
+rejected download climbs a ladder of fallbacks before it is called a failure:
+the URL is repaired, the request is re-dressed (same-origin Referer, then a
+permissive Accept, then a full browser fingerprint with the host's own
+cookies), landing pages are mined for the real link, ZIP reporting packages are
+unpacked, and SRN's cached copy of the same URL is tried last. See the README
+for the resulting status vocabulary in download_log.csv.
+
 Everything is resumable: an already-downloaded, valid PDF is skipped, and so is
 a report whose text file is already newer than its PDF.
 
@@ -38,11 +46,13 @@ import json
 import logging
 import os
 import re
+import shutil
 import threading
 import time
+import zipfile
 from collections import Counter, defaultdict, deque
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qs, unquote, urljoin, urlparse
 
 import pandas as pd
 import requests
@@ -54,7 +64,7 @@ try:                                  # PyMuPDF >= 1.24 prefers the new name
 except ImportError:                   # pragma: no cover - older installs
     import fitz as pymupdf
 
-from srn_client import USER_AGENT, fetch_csrd_reports
+from srn_client import USER_AGENT, fetch_csrd_reports, fetch_mirror_index, mirror_key
 
 # --- config ------------------------------------------------------------------
 
@@ -71,12 +81,14 @@ INDEX_CSV = "reports_index.csv"
 
 DOWNLOAD_WORKERS = 12    # concurrent downloads across all hosts
 HOST_DELAY = 1.0         # min seconds between two requests to the same host
-TIMEOUT = (15, 120)      # (connect, read) seconds
-MAX_RETRIES = 3
+TIMEOUT = (10, 60)       # (connect, read) seconds; read applies per chunk, and a
+                         # host that can't produce 256 KiB in a minute is dead
 MIN_PDF_BYTES = 10_000   # anything smaller is an error page, not a report
 PDF_SNIFF_BYTES = 1024   # the %PDF header must appear within this many bytes
 MAX_PDF_MB = 500         # refuse absurd payloads rather than fill the disk
 CHUNK = 1 << 18          # 256 KiB streaming chunks
+MAX_HTML_CANDIDATES = 4  # PDF links to try on a landing page
+MAX_REDIRECTS = 12       # redirect hops before calling it a loop
 
 logging.basicConfig(
     level=logging.INFO,
@@ -90,6 +102,11 @@ def clean_filename(name):
     """Remove special chars, replace spaces with underscores."""
     name = re.sub(r"[^\w\s-]", "", str(name))
     return re.sub(r"\s+", "_", name.strip())[:80]
+
+
+def _usable(status):
+    """A download status that leaves a PDF on disk ('success:srn_mirror' too)."""
+    return str(status).startswith("success") or status == "skipped"
 
 
 def _as_int(value):
@@ -132,7 +149,10 @@ def load_reports_live(years=None):
     df = pd.DataFrame(rows)
     if df.empty:
         return df
-    df = df[df["link"].str.startswith("http")].copy()
+    # repair the malformed links in the archive here rather than at fetch time,
+    # so a typo'd scheme ("hhttps://") doesn't drop the row from the index
+    df["link"] = df["link"].map(clean_url)
+    df = df[df["link"].map(lambda u: "." in urlparse(u).netloc)].copy()
     # the same PDF can back two rows (e.g. a combined 2024/2025 filing)
     before = len(df)
     df = df.drop_duplicates(subset=["link", "start PDF", "end PDF"]).reset_index(drop=True)
@@ -234,7 +254,12 @@ def get_session():
             "Accept": "application/pdf,text/html;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
         })
-        retry = Retry(total=MAX_RETRIES, backoff_factor=1.5,
+        # Separate budgets on purpose. A 5xx is usually a blip worth three
+        # tries, but a read timeout means the host is hanging, and retrying
+        # that three times costs 3x60s per URL — serialised per host, that one
+        # setting is the difference between a tail of minutes and of an hour.
+        retry = Retry(total=4, connect=2, read=1, status=3,
+                      backoff_factor=1.0, backoff_max=20,
                       status_forcelist=(408, 425, 429, 500, 502, 503, 504),
                       allowed_methods=frozenset(["GET", "HEAD"]),
                       respect_retry_after_header=True)
@@ -245,23 +270,128 @@ def get_session():
     return s
 
 
-def _get(url, verify=True, referer=None):
-    headers = {"Referer": referer} if referer else None
-    return get_session().get(url, timeout=TIMEOUT, stream=True, headers=headers,
-                             verify=verify, allow_redirects=True)
+def _get(url, verify=True, headers=None):
+    """GET, following redirects by hand so a malformed hop can be repaired.
+
+    requests follows redirects internally and raises ``InvalidSchema`` the
+    moment a site answers with a typo'd ``Location`` (one issuer really does
+    send ``hhttps://``). Stepping through them here means the same repair that
+    cleans the archive's links also cleans the server's.
+    """
+    session = get_session()
+    for _ in range(MAX_REDIRECTS):
+        resp = session.get(url, timeout=TIMEOUT, stream=True, headers=headers,
+                           verify=verify, allow_redirects=False)
+        location = resp.headers.get("Location") if resp.is_redirect else None
+        if not location:
+            return resp
+        resp.close()
+        url = clean_url(urljoin(url, location))
+    raise requests.exceptions.TooManyRedirects(f"more than {MAX_REDIRECTS} redirects: {url}")
+
+
+def _origin(url):
+    parts = urlparse(url)
+    return f"{parts.scheme}://{parts.netloc}/"
+
+
+def _warm_host(url, verify=True):
+    """Visit a host's home page once per worker so its WAF sets its cookies.
+
+    Akamai/Cloudflare/Imperva commonly serve a PDF only to a session that has
+    already loaded a page on the same origin. Cheap: once per host per thread.
+    """
+    warmed = getattr(_thread_local, "warmed", None)
+    if warmed is None:
+        warmed = _thread_local.warmed = set()
+    host = urlparse(url).netloc
+    if host in warmed:
+        return
+    warmed.add(host)
+    try:
+        with _get(_origin(url), verify=verify, headers=BROWSER_HEADERS) as resp:
+            resp.raw.read(1, decode_content=True)
+    except requests.RequestException:
+        pass
+
+
+# Statuses that mean "not to a robot" rather than "gone", so they are worth
+# re-asking for with a better-dressed request. 418 is what a couple of
+# bot-detectors answer with instead of 403. A 404 is not here on purpose:
+# the file really is missing and re-asking just wastes the host's time.
+_RETRYABLE_STATUSES = (401, 403, 406, 409, 418, 429, 451)
+
+BROWSER_HEADERS = {
+    "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
+               "image/avif,image/webp,*/*;q=0.8"),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+}
+
+
+def _strategies(url):
+    """(name, extra headers, warm-the-host?) attempts, cheapest first."""
+    origin = _origin(url)
+    return [
+        ("plain", None, False),
+        # a WAF that rejects a bare PDF fetch usually accepts a same-origin click
+        ("referer", {"Referer": origin}, False),
+        # 406 is almost always our narrow Accept header being refused
+        ("any-accept", {"Accept": "*/*", "Referer": origin}, False),
+        # full browser fingerprint plus cookies from the host's own home page
+        ("browser", {**BROWSER_HEADERS, "Referer": origin}, True),
+    ]
+
+
+# Bot walls, recognised so they can be reported as what they are. The first
+# two need a real browser; the third needs a different IP. None of them can be
+# talked past with headers, so recognising one ends the escalation early.
+_CHALLENGE_MARKERS = (
+    ("cloudflare_challenge", ("just a moment", "cf-browser-verification",
+                              "cf_chl_", "challenge-platform", "cf-please-wait")),
+    ("imperva_challenge", ("incapsula", "_incapsula_resource", "imperva")),
+    ("akamai_denied", ("access denied", "reference #", "akamaighost")),
+)
+
+
+def _detect_challenge(resp):
+    """Name the bot wall behind a rejection, or None if it's an ordinary refusal."""
+    try:
+        body = _read_capped(resp, 8192).lower()
+    except requests.RequestException:
+        return None
+    server = resp.headers.get("Server", "").lower()
+    for name, markers in _CHALLENGE_MARKERS:
+        if any(m in body for m in markers):
+            return name
+    if "cloudflare" in server:
+        return "cloudflare_challenge"
+    return None
 
 
 def _get_tolerant(url, verify=True):
-    """GET, retrying a 401/403 once with a same-origin Referer.
-
-    Several IR sites sit behind a WAF that rejects a bare request for a PDF but
-    serves it happily when it looks like a click from the company's own page.
-    """
-    resp = _get(url, verify=verify)
-    if resp.status_code in (401, 403):
-        parts = urlparse(url)
-        resp.close()
-        resp = _get(url, verify=verify, referer=f"{parts.scheme}://{parts.netloc}/")
+    """GET, escalating through the strategies above while the server says no."""
+    resp = None
+    for name, headers, warm in _strategies(url):
+        if warm:
+            _warm_host(url, verify)
+        if resp is not None:
+            resp.close()
+        resp = _get(url, verify=verify, headers=headers)
+        if resp.status_code not in _RETRYABLE_STATUSES:
+            if name != "plain":
+                log.debug("  %s accepted via '%s'", url, name)
+            return resp
+        challenge = _detect_challenge(resp)
+        if challenge:
+            # a JS proof-of-work wall or an IP block: dressing the request up
+            # further cannot help, so stop spending requests on this host
+            resp.challenge = challenge
+            return resp
     return resp
 
 
@@ -275,16 +405,70 @@ def _read_capped(resp, limit):
     return buf.decode(resp.encoding or "utf-8", errors="ignore")
 
 
-def _find_pdf_link_in_html(html, base_url):
-    """Some links point at a landing page; find the report PDF on it."""
-    links = re.findall(r'href=["\']([^"\']*\.pdf(?:\?[^"\']*)?)["\']', html, re.IGNORECASE)
-    if not links:
-        return None
-    keywords = ("annual", "report", "sustainability", "csrd", "esg", "nachhaltig")
-    for link in links:
-        if any(kw in link.lower() for kw in keywords):
-            return urljoin(base_url, link)
-    return urljoin(base_url, links[0])
+_REPORT_KEYWORDS = ("annual", "report", "sustainability", "csrd", "esg",
+                    "nachhaltig", "integrated", "universal", "rapport", "bericht")
+
+
+def _find_pdf_links_in_html(html, base_url):
+    """Candidate PDF URLs on a landing page, best first.
+
+    Report links hide in more than plain anchors: meta-refresh redirects, PDF
+    viewers in an ``<iframe>``/``<embed>``, and download buttons whose href has
+    no ``.pdf`` extension but says "download" instead.
+    """
+    found = []
+
+    meta = re.search(r'http-equiv=["\']refresh["\'][^>]*content=["\'][^"\']*url=([^"\'>]+)',
+                     html, re.IGNORECASE)
+    if meta:
+        found.append(meta.group(1).strip())
+
+    # href/src ending in .pdf (anchors, iframes, embeds, objects)
+    found += re.findall(r'(?:href|src|data)=["\']([^"\']*\.pdf(?:\?[^"\']*)?)["\']',
+                        html, re.IGNORECASE)
+    # extensionless download endpoints, e.g. /media/12345/download
+    found += re.findall(r'href=["\']([^"\']*/(?:download|getfile|dokument)[^"\']*)["\']',
+                        html, re.IGNORECASE)
+
+    ranked, seen = [], set()
+    for link in sorted(found, key=lambda l: 0 if any(k in l.lower() for k in _REPORT_KEYWORDS) else 1):
+        if link.lower().startswith(("javascript:", "mailto:", "#", "data:")):
+            continue
+        absolute = clean_url(urljoin(base_url, link))
+        if absolute not in seen:
+            seen.add(absolute)
+            ranked.append(absolute)
+    return ranked
+
+
+ZIP_MAGIC = b"PK\x03\x04"
+
+
+def _pdf_from_zip(zip_path, dest):
+    """Pull the report PDF out of a ZIP. Returns (bytes, error).
+
+    ESEF filings — common in Poland and the Baltics — are delivered as a zipped
+    reporting package. The PDF is usually in there next to the iXBRL, and it is
+    the largest member; a package that really is XHTML-only has no PDF at all.
+    """
+    try:
+        with zipfile.ZipFile(zip_path) as archive:
+            members = [m for m in archive.infolist()
+                       if m.filename.lower().endswith(".pdf") and not m.is_dir()]
+            if not members:
+                return 0, "zip_without_pdf"
+            best = max(members, key=lambda m: m.file_size)
+            if best.file_size > MAX_PDF_MB * 1024 * 1024:
+                return best.file_size, f"too_large_over_{MAX_PDF_MB}mb"
+            with archive.open(best) as src, open(dest, "wb") as out:
+                shutil.copyfileobj(src, out)
+    except (zipfile.BadZipFile, OSError, RuntimeError) as e:
+        return 0, f"bad_zip:{type(e).__name__}"
+    size = os.path.getsize(dest)
+    if size < MIN_PDF_BYTES:
+        os.remove(dest)
+        return size, "file_too_small"
+    return size, None
 
 
 def _stream_to_file(resp, dest):
@@ -300,19 +484,21 @@ def _stream_to_file(resp, dest):
                     continue
                 if not sniffed:
                     # the header sits in the first KB (the spec tolerates a
-                    # preamble); no %PDF there means an error page, so bail
-                    # before pulling the other 99 MB
+                    # preamble); neither %PDF nor a ZIP there means an error
+                    # page, so bail before pulling the other 99 MB
                     head += chunk[:PDF_SNIFF_BYTES]
                     if len(head) >= PDF_SNIFF_BYTES:
-                        if b"%PDF" not in head:
+                        if not _looks_like_report(head):
                             return 0, "not_pdf"
                         sniffed = True
                 total += len(chunk)
                 if total > limit:
                     return total, f"too_large_over_{MAX_PDF_MB}mb"
                 f.write(chunk)
-        if b"%PDF" not in head:
+        if not _looks_like_report(head):
             return total, "not_pdf"
+        if head.startswith(ZIP_MAGIC):
+            return _pdf_from_zip(part, dest)
         if total < MIN_PDF_BYTES:
             return total, "file_too_small"
         os.replace(part, dest)
@@ -320,6 +506,10 @@ def _stream_to_file(resp, dest):
     finally:
         if os.path.exists(part):
             os.remove(part)
+
+
+def _looks_like_report(head):
+    return b"%PDF" in head or head.startswith(ZIP_MAGIC)
 
 
 def _valid_pdf_on_disk(path):
@@ -332,49 +522,116 @@ def _valid_pdf_on_disk(path):
         return False
 
 
-def download_one(url, dest, throttle, refresh=False):
-    """Fetch one report PDF. Returns (status, bytes, final_url)."""
+def clean_url(url):
+    """Repair the malformed links the archive occasionally carries.
+
+    Real examples: a doubled scheme prefix (``hhttps://``), a scheme-relative
+    link, stray whitespace, and google.com/url?...&url=<real> wrappers.
+    """
+    url = (url or "").strip().replace(" ", "%20")
+    url = re.sub(r"^h+(ttps?://)", r"h\1", url, flags=re.IGNORECASE)
+    if url.startswith("//"):
+        url = "https:" + url
+    elif not re.match(r"^https?://", url, re.IGNORECASE):
+        url = "https://" + url.lstrip("/")
+
+    parts = urlparse(url)
+    if parts.netloc.endswith("google.com") and parts.path == "/url":
+        query = parse_qs(parts.query)
+        target = query.get("url") or query.get("q")
+        if target:
+            return clean_url(unquote(target[0]))
+    return url
+
+
+def _try_url(url, dest, follow_html=True):
+    """One URL -> a PDF on disk. Returns (status, bytes, final_url).
+
+    ``follow_html`` is cleared on the recursive call so a landing page that
+    links to another landing page can't send us round in circles.
+    """
+    try:
+        resp = _get_tolerant(url)
+    except requests.exceptions.SSLError:
+        # a surprising number of IR sites have broken chains
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        resp = _get_tolerant(url, verify=False)
+
+    with resp:
+        final_url = resp.url
+        if resp.status_code >= 400:
+            wall = getattr(resp, "challenge", None)
+            return (f"error:{wall}" if wall else f"error:http_{resp.status_code}"), 0, final_url
+        is_html = "html" in resp.headers.get("Content-Type", "").lower()
+        if not is_html:
+            size, err = _stream_to_file(resp, dest)
+            if err != "not_pdf":
+                return (f"error:{err}" if err else "success"), size, final_url
+            # the Content-Type lied — some servers label an error page
+            # application/octet-stream. Fall through and read it as HTML.
+        if not follow_html:
+            return "not_pdf", 0, final_url
+        body = _read_capped(resp, 400_000) if is_html else None
+
+    if body is None:                      # mislabelled body, already consumed
+        with _get_tolerant(url) as retry_resp:
+            body = _read_capped(retry_resp, 400_000)
+    candidates = _find_pdf_links_in_html(body, final_url)
+
+    # a landing page: try its best few candidates rather than only the first,
+    # and don't let one dead candidate cost us the rest of them
+    for candidate in candidates[:MAX_HTML_CANDIDATES]:
+        try:
+            status, size, _ = _try_url(candidate, dest, follow_html=False)
+        except requests.RequestException:
+            continue
+        if status == "success":
+            return status, size, candidate
+    return ("not_pdf" if candidates else "html_no_pdf_link"), 0, final_url
+
+
+def download_one(url, dest, throttle, refresh=False, mirror_url=None):
+    """Fetch one report PDF, escalating through fallbacks until one works."""
     if not refresh and _valid_pdf_on_disk(dest):
         return "skipped", os.path.getsize(dest), url
 
+    url = clean_url(url)
     host, lock = throttle.lock_for(url)
     with lock:
         throttle.wait(host)
         try:
-            try:
-                resp = _get_tolerant(url)
-            except requests.exceptions.SSLError:
-                # a surprising number of IR sites have broken chains
-                import urllib3
-                urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-                resp = _get_tolerant(url, verify=False)
-
-            with resp:
-                if resp.status_code >= 400:
-                    return f"error:http_{resp.status_code}", 0, resp.url
-                ctype = resp.headers.get("Content-Type", "").lower()
-
-                if "html" in ctype:
-                    pdf_url = _find_pdf_link_in_html(_read_capped(resp, 400_000), resp.url)
-                    if not pdf_url:
-                        return "not_pdf", 0, resp.url
-                    resp2 = _get_tolerant(pdf_url)
-                    with resp2:
-                        if resp2.status_code >= 400:
-                            return f"error:http_{resp2.status_code}", 0, pdf_url
-                        size, err = _stream_to_file(resp2, dest)
-                        return (f"error:{err}" if err else "success"), size, pdf_url
-
-                size, err = _stream_to_file(resp, dest)
-                return (f"error:{err}" if err else "success"), size, resp.url
+            status, size, final = _try_url(url, dest)
         except requests.exceptions.Timeout:
-            return "error:timeout", 0, url
+            status, size, final = "error:timeout", 0, url
+        except requests.exceptions.RetryError as e:
+            status, size, final = "error:retries_exhausted", 0, url
+            log.debug("%s: %s", url, e)
+        except requests.exceptions.TooManyRedirects:
+            status, size, final = "error:redirect_loop", 0, url
         except requests.exceptions.ConnectionError as e:
-            return f"error:connection:{type(e).__name__}", 0, url
+            # A host that hangs up mid-handshake rather than answering is
+            # fingerprinting the TLS client, which no header can dress around —
+            # worth its own status so recover_failed.py can target those.
+            dropped = any(w in str(e) for w in
+                          ("RemoteDisconnected", "ConnectionResetError", "EOF occurred"))
+            status = "error:connection_dropped" if dropped else "error:connection"
+            size, final = 0, url
         except requests.RequestException as e:
-            return f"error:{type(e).__name__}", 0, url
+            status, size, final = f"error:{type(e).__name__}", 0, url
         finally:
             throttle.done(host)
+
+    # last resort: SRN caches a copy of some reports and serves it from its own
+    # API, which sidesteps a dead company link or an IP-blocking WAF entirely
+    if not _usable(status) and mirror_url:
+        try:
+            m_status, m_size, m_final = _try_url(mirror_url, dest, follow_html=False)
+            if m_status == "success":
+                return "success:srn_mirror", m_size, m_final
+        except requests.RequestException:
+            pass
+    return status, size, final
 
 
 def _interleave_by_host(jobs):
@@ -406,7 +663,8 @@ def download_all(jobs, workers=DOWNLOAD_WORKERS, refresh=False, host_delay=HOST_
 
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = {
-                pool.submit(download_one, job["url"], job["dest"], throttle, refresh): job
+                pool.submit(download_one, job["url"], job["dest"], throttle,
+                            refresh, job.get("mirror")): job
                 for job in _interleave_by_host(jobs)
             }
             for n, future in enumerate(as_completed(futures), 1):
@@ -422,7 +680,7 @@ def download_all(jobs, workers=DOWNLOAD_WORKERS, refresh=False, host_delay=HOST_
                     writer.writerow([job["stem"], job["company"], job["isin"], job["url"],
                                      final_url, status, size, job["dest"]])
                     f.flush()
-                if status == "success":
+                if status.startswith("success"):
                     log.info("[%d/%d] %s (%.1f MB)", n, len(jobs), job["company"],
                              size / 1e6)
                 elif status == "skipped":
@@ -431,7 +689,7 @@ def download_all(jobs, workers=DOWNLOAD_WORKERS, refresh=False, host_delay=HOST_
                     log.warning("[%d/%d] %s -> %s", n, len(jobs), job["company"], status)
 
     elapsed = time.monotonic() - started
-    ok = sum(1 for s, _ in results.values() if s in ("success", "skipped"))
+    ok = sum(1 for s, _ in results.values() if _usable(s))
     log.info("Downloads finished in %.1f min: %d/%d usable (%.1f reports/min)",
              elapsed / 60, ok, len(jobs), len(jobs) / max(elapsed / 60, 1e-9))
     return results
@@ -669,7 +927,7 @@ def build_summary(df, downloads, extractions, path=SUMMARY_CSV):
 
 def report_totals(summary):
     dl = summary["download_status"].map(
-        lambda s: "ok" if s in ("success", "skipped") else "failed").value_counts()
+        lambda s: "ok" if _usable(s) else "failed").value_counts()
     log.info("Downloads : %d ok, %d failed", dl.get("ok", 0), dl.get("failed", 0))
     ex = summary["extraction_status"].value_counts()
     log.info("Extraction: %s", ", ".join(f"{k}={v}" for k, v in ex.items()))
@@ -681,7 +939,7 @@ def report_totals(summary):
                  f"{int(done['tables_found'].sum()):,}")
         langs = done["language"].value_counts().head(6)
         log.info("Languages : %s", ", ".join(f"{k}={v}" for k, v in langs.items()))
-        failed = summary[~summary["download_status"].isin(("success", "skipped"))]
+        failed = summary[~summary["download_status"].map(_usable)]
         if not failed.empty:
             top = failed["download_status"].value_counts().head(5)
             log.info("Top download failures: %s",
@@ -710,6 +968,8 @@ def main():
                     help="Keep every detected table, including chart-axis false positives")
     ap.add_argument("--full-pages", action="store_true",
                     help="Extract whole documents, ignoring the sustainability page range")
+    ap.add_argument("--no-mirror", action="store_true",
+                    help="Don't fall back to SRN's cached copy when a company link fails")
     ap.add_argument("--refresh", action="store_true", help="Re-download PDFs already on disk")
     ap.add_argument("--re-extract", action="store_true",
                     help="Re-parse PDFs whose text file already exists")
@@ -750,8 +1010,10 @@ def main():
     log.info("STEP 2: Downloading PDFs (%d workers, %.1fs per host)",
              args.workers, args.host_delay)
     log.info("=" * 60)
+    mirrors = {} if args.no_mirror else fetch_mirror_index()
     jobs = [{"stem": r["_stem"], "company": r["company"], "isin": r.get("isin", ""),
-             "url": r["link"], "dest": os.path.join(PDF_DIR, f"{r['_stem']}.pdf")}
+             "url": r["link"], "dest": os.path.join(PDF_DIR, f"{r['_stem']}.pdf"),
+             "mirror": mirrors.get(mirror_key(r["link"]))}
             for _, r in df.iterrows()]
     if args.skip_download:
         downloads = {j["stem"]: (("skipped", os.path.getsize(j["dest"]))
@@ -770,7 +1032,7 @@ def main():
     tasks, cached = [], {}
     for _, row in df.iterrows():
         stem = row["_stem"]
-        if downloads.get(stem, ("", 0))[0] not in ("success", "skipped"):
+        if not _usable(downloads.get(stem, ("", 0))[0]):
             continue
         pdf_path = os.path.join(PDF_DIR, f"{stem}.pdf")
         if not os.path.exists(pdf_path):

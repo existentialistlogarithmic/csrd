@@ -228,6 +228,46 @@ def fetch_api_json(path, session=None, timeout=60):
     return None, None
 
 
+def mirror_key(url):
+    """Normalise a report URL for matching against SRN's cached copies."""
+    url = re.sub(r"^https?://", "", (url or "").strip(), flags=re.IGNORECASE)
+    return url.split("?")[0].rstrip("/").lower()
+
+
+def fetch_mirror_index(session=None):
+    """Map ``mirror_key(original_url) -> SRN mirror download URL``.
+
+    SRN keeps its own cached copy of the documents in its older
+    ``/api/documents`` table and serves them from
+    ``/api/documents/{id}/download``, which sidesteps a dead company link or an
+    IP-blocking WAF.
+
+    Keyed on the **source URL**, deliberately, not on ``(isin, year)``: the
+    CSRD archive's page ranges are measured against one specific file, and a
+    same-company-same-year match could easily be a different document, which
+    would silently extract the wrong pages. Matching the URL means the cached
+    copy is the same file the range was measured against. That is a smaller
+    net — roughly 150 of 2 000 reports — but it cannot mislead.
+
+    Returns ``{}`` if the API can't be reached; the mirror is a bonus, never a
+    requirement.
+    """
+    documents, base = fetch_api_json("/documents", session)
+    if not documents:
+        log.warning("SRN mirror index unavailable — continuing without it")
+        return {}
+
+    mirror = {}
+    for d in documents:
+        if not isinstance(d, dict) or not d.get("id"):
+            continue
+        key = mirror_key(d.get("href"))
+        if key:
+            mirror.setdefault(key, f"{base.rstrip('/')}/documents/{d['id']}/download")
+    log.info("SRN mirror index: %d cached documents", len(mirror))
+    return mirror
+
+
 def _main():
     import argparse
     from collections import Counter
