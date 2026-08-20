@@ -201,6 +201,54 @@ python3 phase2b_hf.py --no-finbert --no-climatebert   # embeddings only
 
 Outputs per-report JSON in `hf_output/` plus `hf_esg_scores.csv`.
 
+### Phase 3b — ESRS extraction with neural models, no LLM (free)
+
+The same ESRS output as phase 3, produced by three small encoders on CPU
+instead of a generative model. Nothing paid, nothing leaves the machine.
+
+```bash
+pip install -r requirements-hf.txt
+python3 phase3b_neural.py --limit 5
+python3 phase3b_neural.py                 # whole corpus, ~4 h on 4 cores
+python3 phase3b_neural.py --no-qa         # statuses only, ~30% faster
+```
+
+How it works, and why each model is there:
+
+| stage | model | job |
+| --- | --- | --- |
+| retrieve | `all-MiniLM-L6-v2` | embed every sentence and every DR, shortlist passages per DR |
+| classify | `deberta-v3-xsmall-zeroshot` | does the passage *entail* "this report discloses &lt;DR&gt;"? |
+| extract | `tinyroberta-squad2` | pull the number out, the answer span doubling as evidence |
+
+Similarity alone is a poor judge here — sustainability prose is uniformly
+on-topic, so best-similarity per DR runs p5=0.46 / median=0.64 across the
+corpus. It is used only to shortlist; entailment makes the call.
+
+Two corrections that mattered more than any threshold:
+
+* **The ESRS content index is filtered out.** It repeats every DR title
+  verbatim next to a page number, so on title similarity it beats real prose
+  every time — in every report sampled, the most-reused top hit was an index
+  row. The system prompt warns the LLM about exactly this ("a high-value map,
+  not evidence of substantive disclosure"); here it has to be explicit.
+* **A sentence may serve at most three DRs.** Cross-reference boilerplate
+  ("for further information, please refer to …") otherwise answers a dozen.
+
+**Validation.** Over a 70-report sample, coverage tracks SRN's independent,
+human-assigned `csrd_compliant` flag: reports marked *full* score 61.5 DRs
+reported against 48.5 for *partial* (Mann-Whitney one-sided, **p = 0.0092**).
+It is not simply measuring length — correlation with word count is r = 0.23.
+
+**What it cannot do**, against the LLM backend: it cannot reason about a
+disclosure it failed to retrieve, cannot normalise units it has not seen, and
+gives a status with a grounded quote rather than an argued judgement.
+Datapoint extraction is deliberately conservative — a span with no unit that
+looks like a year, a section number, or two numbers run together is rejected
+rather than reported — so expect few datapoints per report and trust the ones
+you get. Output goes to `esrs_neural_output/` and `esrs_neural_coverage.csv`,
+in the same schema as phase 3, so the two backends are directly comparable.
+
 ### Phase 3 — ESRS disclosure-requirement extraction
 
 Maps each report onto the ESRS Set 1 DR taxonomy in `esrs_system_prompt.md`: the
@@ -251,6 +299,7 @@ comparable.
 | `phase2.py` | keyword ESG analysis + charts |
 | `phase2b_hf.py` | local Hugging Face semantic scoring |
 | `phase3_esrs.py` | ESRS extraction (Anthropic) + shared helpers |
+| `phase3b_neural.py` | ESRS extraction with local encoders, no LLM, free |
 | `phase3_local.py` | ESRS extraction (Ollama / vLLM / Groq / OpenRouter / OpenAI) |
 | `recover_failed.py` | browser-based retry for WAF-blocked downloads |
 | `esrs_system_prompt.md` | the ESRS Set 1 reference taxonomy and output schema |
