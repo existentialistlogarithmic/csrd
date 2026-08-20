@@ -27,3 +27,11 @@ hf_esg_scores.csv
 esrs_output/
 esrs_coverage.csv
 esrs_failures.csv
+
+# nohup logs from long background runs
+*_run.log
+
+# phase3b outputs (regenerated on each run)
+esrs_neural_output/
+esrs_neural_coverage.csv
+esrs_neural_failures.csv

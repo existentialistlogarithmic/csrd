@@ -44,6 +44,7 @@ import glob
 import io
 import json
 import logging
+import multiprocessing
 import os
 import re
 import shutil
@@ -52,6 +53,7 @@ import time
 import zipfile
 from collections import Counter, defaultdict, deque
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 from urllib.parse import parse_qs, unquote, urljoin, urlparse
 
 import pandas as pd
@@ -647,52 +649,136 @@ def _interleave_by_host(jobs):
     return order
 
 
-def download_all(jobs, workers=DOWNLOAD_WORKERS, refresh=False, host_delay=HOST_DELAY):
-    """Download every job's PDF concurrently. Returns {stem: (status, bytes)}."""
+def run_pipeline(jobs, download_workers, extract_workers, refresh=False,
+                 host_delay=HOST_DELAY, max_pending=None):
+    """Download and parse concurrently. Returns (downloads, extractions).
+
+    Downloading is network-bound and parsing is CPU-bound, so running them as
+    two sequential phases leaves one resource idle throughout each. Here a PDF
+    is handed to the process pool the moment its bytes land, which means the
+    cores are busy while the next batch is still in flight and the whole run
+    costs about as long as the slower of the two rather than their sum.
+
+    Each job carries its own extraction task, so the parse starts with the page
+    range already attached — no second pass over the index.
+
+    Downloading is ~20x faster than parsing, so without backpressure the whole
+    corpus (~40 GB of PDFs) would land on disk long before the parsers got to
+    it. ``max_pending`` caps how many fetched-but-unparsed PDFs may exist at
+    once: a downloader takes a slot before it writes and the slot comes back
+    when that PDF has been parsed, which keeps disk flat at roughly
+    max_pending x the average report.
+    """
     throttle = HostThrottle(host_delay)
-    results = {}
+    downloads, extractions = {}, {}
     started = time.monotonic()
     is_new = not os.path.exists(DOWNLOAD_LOG)
+    n_dl = n_ex = 0
+    pending = threading.BoundedSemaphore(max_pending or max(8, extract_workers * 8))
 
-    with open(DOWNLOAD_LOG, "a", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
+    def fetch(job):
+        """Download, holding a disk slot. The slot is released by whoever
+        decides no parse will follow, or by the parse's completion callback."""
+        pending.acquire()
+        try:
+            return download_one(job["url"], job["dest"], throttle,
+                                refresh, job.get("mirror"))
+        except BaseException:
+            pending.release()
+            raise
+
+    parsers = ParsePool(extract_workers)
+    with open(DOWNLOAD_LOG, "a", newline="", encoding="utf-8") as logfile, \
+            ThreadPoolExecutor(max_workers=download_workers) as fetchers:
+        writer = csv.writer(logfile)
         if is_new:
             writer.writerow(["stem", "company", "isin", "url", "final_url",
                              "status", "bytes", "dest"])
-        log_lock = threading.Lock()
 
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {
-                pool.submit(download_one, job["url"], job["dest"], throttle,
-                            refresh, job.get("mirror")): job
-                for job in _interleave_by_host(jobs)
-            }
-            for n, future in enumerate(as_completed(futures), 1):
-                job = futures[future]
+        parse_futures = {}
+
+        def harvest(block=False):
+            """Collect finished parses so their logging interleaves with the
+            download progress instead of arriving in one lump at the end."""
+            nonlocal n_ex
+            done = [f for f in parse_futures if f.done()] if not block else list(parse_futures)
+            broken = False
+            for future in done:
+                job = parse_futures.pop(future)
                 try:
-                    status, size, final_url = future.result()
-                except Exception as e:               # noqa: BLE001 - never kill the run
-                    status, size, final_url = f"error:{type(e).__name__}", 0, job["url"]
-                    log.debug("%s: %s", job["stem"], e)
-                results[job["stem"]] = (status, size)
-
-                with log_lock:
-                    writer.writerow([job["stem"], job["company"], job["isin"], job["url"],
-                                     final_url, status, size, job["dest"]])
-                    f.flush()
-                if status.startswith("success"):
-                    log.info("[%d/%d] %s (%.1f MB)", n, len(jobs), job["company"],
-                             size / 1e6)
-                elif status == "skipped":
-                    log.debug("[%d/%d] %s (cached)", n, len(jobs), job["company"])
+                    result = future.result()
+                except BrokenProcessPool:
+                    # this document (or one beside it) killed the worker
+                    result = _failed_extraction(job["stem"], "parser process crashed")
+                    broken = True
+                except Exception as e:               # noqa: BLE001
+                    result = _failed_extraction(job["stem"], str(e))
+                extractions[result["stem"]] = result
+                n_ex += 1
+                if result["extraction_status"] == "success":
+                    log.info("  parsed  [%d] %s — %d pages, %d words, %d tables, %s",
+                             n_ex, result["stem"], result["pages_extracted"],
+                             result["word_count"], result["tables_found"], result["language"])
                 else:
-                    log.warning("[%d/%d] %s -> %s", n, len(jobs), job["company"], status)
+                    log.warning("  parsed  [%d] %s — failed: %s",
+                                n_ex, result["stem"], result.get("error", ""))
+            if broken:
+                parsers.rebuild()
 
-    elapsed = time.monotonic() - started
-    ok = sum(1 for s, _ in results.values() if _usable(s))
-    log.info("Downloads finished in %.1f min: %d/%d usable (%.1f reports/min)",
-             elapsed / 60, ok, len(jobs), len(jobs) / max(elapsed / 60, 1e-9))
-    return results
+        fetch_futures = {fetchers.submit(fetch, job): job
+                         for job in _interleave_by_host(jobs)}
+        for future in as_completed(fetch_futures):
+            job = fetch_futures[future]
+            n_dl += 1
+            held_slot = True
+            try:
+                status, size, final_url = future.result()
+            except Exception as e:                   # noqa: BLE001 - never kill the run
+                status, size, final_url = f"error:{type(e).__name__}", 0, job["url"]
+                held_slot = False                    # fetch() already released it
+                log.debug("%s: %s", job["stem"], e)
+            downloads[job["stem"]] = (status, size)
+
+            writer.writerow([job["stem"], job["company"], job["isin"], job["url"],
+                             final_url, status, size, job["dest"]])
+            logfile.flush()
+            if status.startswith("success"):
+                log.info("fetched [%d/%d] %s (%.1f MB)",
+                         n_dl, len(jobs), job["company"], size / 1e6)
+            elif status != "skipped":
+                log.warning("fetched [%d/%d] %s -> %s", n_dl, len(jobs), job["company"], status)
+
+            # hand it straight to a parser while the other downloads continue
+            task = job.get("task")
+            if task and _usable(status) and os.path.exists(task["pdf_path"]):
+                parse_future = parsers.submit(task)
+                if parse_future is not None:
+                    parse_futures[parse_future] = job
+                    # free the disk slot once this PDF has been parsed (and,
+                    # with --discard-pdfs, deleted). A callback rather than
+                    # harvest() so a main thread blocked in as_completed can
+                    # never starve downloaders waiting on a slot.
+                    parse_future.add_done_callback(lambda _f: pending.release())
+                else:
+                    extractions[job["stem"]] = _failed_extraction(
+                        job["stem"], "parser pool unavailable")
+                    pending.release()
+            elif held_slot:
+                pending.release()                    # nothing to parse, let the next in
+            harvest()
+
+        log.info("Downloads done (%d/%d usable); waiting on %d parse(s)",
+                 sum(1 for s, _ in downloads.values() if _usable(s)), len(jobs),
+                 len(parse_futures))
+        while parse_futures:
+            harvest(block=True)
+        parsers.shutdown()
+
+    elapsed = max(time.monotonic() - started, 1e-9)
+    ok = sum(1 for s, _ in downloads.values() if _usable(s))
+    log.info("Pipeline finished in %.1f min: %d/%d downloaded, %d parsed (%.1f reports/min)",
+             elapsed / 60, ok, len(jobs), len(extractions), len(jobs) / (elapsed / 60))
+    return downloads, extractions
 
 
 # --- 3. extraction (text + tables) -------------------------------------------
@@ -778,6 +864,65 @@ def _useful_table(rows):
     return any(_WORD_CELL.search(c) for c in cells)
 
 
+class ParsePool:
+    """A process pool that survives a worker dying on a malformed PDF.
+
+    MuPDF is C, and a corrupt document can abort the whole worker process
+    ("malloc(): unaligned tcache chunk detected" is one we hit on the live
+    corpus). ProcessPoolExecutor then marks itself permanently broken and its
+    shutdown hangs waiting on processes that no longer exist, which takes down
+    a three-hour run over one bad file. So: notice the breakage, abandon the
+    dead pool, build a fresh one, and let the in-flight documents come back as
+    failures rather than retrying a file that just killed a worker.
+    """
+
+    def __init__(self, workers, max_tasks_per_child=100):
+        self.workers = workers
+        # recycling workers also caps the damage from any slow native leak
+        self.max_tasks_per_child = max_tasks_per_child
+        self.rebuilds = 0
+        # "spawn", not the Linux default fork: this pool is created while ~20
+        # download threads are already running, and forking a threaded process
+        # is a well-known way to inherit a held lock and deadlock a child.
+        # Spawned workers pay an import each, which recycling amortises.
+        self._ctx = multiprocessing.get_context("spawn")
+        self._pool = self._new_pool()
+
+    def _new_pool(self):
+        return ProcessPoolExecutor(max_workers=self.workers,
+                                   mp_context=self._ctx,
+                                   max_tasks_per_child=self.max_tasks_per_child)
+
+    def submit(self, task):
+        try:
+            return self._pool.submit(extract_one, task)
+        except BrokenProcessPool:
+            self.rebuild()
+            try:
+                return self._pool.submit(extract_one, task)
+            except BrokenProcessPool:
+                return None
+
+    def rebuild(self):
+        self.rebuilds += 1
+        log.warning("Parser pool died (a PDF crashed MuPDF) — restarting it "
+                    "(restart #%d)", self.rebuilds)
+        # don't wait: the workers are already gone and shutdown would block
+        with contextlib.suppress(Exception):
+            self._pool.shutdown(wait=False, cancel_futures=True)
+        self._pool = self._new_pool()
+
+    def shutdown(self):
+        with contextlib.suppress(Exception):
+            self._pool.shutdown(wait=True)
+
+
+def _failed_extraction(stem, error):
+    return {"stem": stem, "extraction_status": "failed", "error": error,
+            "language": "unknown", "pages_extracted": 0, "word_count": 0,
+            "tables_found": 0, "pdf_pages": 0, "text_file": None, "table_file": None}
+
+
 def extract_one(task):
     """Text + tables for one PDF, with the table finder's stdout hints muted.
 
@@ -785,7 +930,14 @@ def extract_one(task):
     since nothing here legitimately prints, swallowing stdout is safe.
     """
     with contextlib.redirect_stdout(io.StringIO()):
-        return _extract_one(task)
+        result = _extract_one(task)
+    if task.get("discard_pdf") and result["extraction_status"] == "success":
+        # on a full run the PDFs are ~40 GB and only the text is needed
+        # downstream; dropping each one as soon as it is parsed keeps the
+        # corpus on disk at the size of its text rather than its sources
+        with contextlib.suppress(OSError):
+            os.remove(task["pdf_path"])
+    return result
 
 
 def _extract_one(task):
@@ -821,7 +973,12 @@ def _extract_one(task):
             # [[page:N]] markers let phase 3 cite the PDF page an answer came from
             chunks.append(f"[[page:{p + 1}]]\n"
                           + page.get_text("text", flags=pymupdf.TEXT_PRESERVE_LIGATURES))
-            if task["tables"]:
+            # find_tables costs ~40x a text extraction, and it is the whole
+            # reason a full parse takes hours. Its default "lines" strategy
+            # builds tables out of drawn rules, so a page with no vector
+            # drawings at all cannot yield one — get_cdrawings is ~40x cheaper
+            # and skips roughly half the pages of a typical report for free.
+            if task["tables"] and page.get_cdrawings():
                 try:
                     for table in page.find_tables().tables:
                         rows = [[c if c is not None else "" for c in row]
@@ -925,6 +1082,39 @@ def build_summary(df, downloads, extractions, path=SUMMARY_CSV):
     return out
 
 
+def _reuse_extraction(stem, text_path, pdf_path, re_extract=False):
+    """Rebuild an extraction result from text already on disk, or None.
+
+    Resume without re-parsing, and without needing the PDF to still be there —
+    a run with --discard-pdfs keeps only the text, and that is enough.
+    """
+    if re_extract or not os.path.exists(text_path):
+        return None
+    if os.path.exists(pdf_path) and os.path.getmtime(text_path) < os.path.getmtime(pdf_path):
+        return None                       # the PDF was refreshed after the parse
+    try:
+        with open(text_path, encoding="utf-8") as f:
+            body = f.read()
+    except OSError:
+        return None
+    table_path = os.path.join(TABLE_DIR, f"{stem}_tables.json")
+    n_tables = 0
+    if os.path.exists(table_path):
+        try:
+            with open(table_path, encoding="utf-8") as f:
+                n_tables = len(json.load(f))
+        except (OSError, json.JSONDecodeError):
+            n_tables = 0
+    return {
+        "stem": stem, "extraction_status": "success", "error": "",
+        "language": detect_language(body),
+        "pages_extracted": body.count("[[page:"), "pdf_pages": 0,
+        "word_count": len(re.sub(r"\[\[page:\d+\]\]", " ", body).split()),
+        "tables_found": n_tables, "text_file": text_path,
+        "table_file": table_path if n_tables else None,
+    }
+
+
 def report_totals(summary):
     dl = summary["download_status"].map(
         lambda s: "ok" if _usable(s) else "failed").value_counts()
@@ -975,6 +1165,12 @@ def main():
                     help="Re-parse PDFs whose text file already exists")
     ap.add_argument("--skip-download", action="store_true",
                     help="Only extract from PDFs already in pdfs/")
+    ap.add_argument("--max-pending", type=int,
+                    help="Cap on fetched-but-unparsed PDFs (default: 8 per parser). "
+                         "This is what keeps disk flat on a full run")
+    ap.add_argument("--discard-pdfs", action="store_true",
+                    help="Delete each PDF once parsed (the full corpus is ~40 GB of "
+                         "source PDFs but only ~2 GB of text)")
     args = ap.parse_args()
 
     for d in (PDF_DIR, TEXT_DIR, TABLE_DIR):
@@ -1005,72 +1201,58 @@ def main():
     df.drop(columns=["_stem"]).to_csv(INDEX_CSV, index=False)
     log.info("Processing %d reports (index written to %s)", len(df), INDEX_CSV)
 
-    # 2. download
+    # 2. fetch and parse, overlapped
     log.info("=" * 60)
-    log.info("STEP 2: Downloading PDFs (%d workers, %.1fs per host)",
-             args.workers, args.host_delay)
+    log.info("STEP 2: Fetching and parsing (%d downloaders, %d parsers, %.1fs per host)",
+             args.workers, args.extract_workers, args.host_delay)
     log.info("=" * 60)
     mirrors = {} if args.no_mirror else fetch_mirror_index()
-    jobs = [{"stem": r["_stem"], "company": r["company"], "isin": r.get("isin", ""),
-             "url": r["link"], "dest": os.path.join(PDF_DIR, f"{r['_stem']}.pdf"),
-             "mirror": mirrors.get(mirror_key(r["link"]))}
-            for _, r in df.iterrows()]
+
+    jobs, cached = [], {}
+    for _, row in df.iterrows():
+        stem = row["_stem"]
+        pdf_path = os.path.join(PDF_DIR, f"{stem}.pdf")
+        text_path = os.path.join(TEXT_DIR, f"{stem}.txt")
+        reused = _reuse_extraction(stem, text_path, pdf_path, args.re_extract)
+        if reused:
+            cached[stem] = reused
+            continue
+        jobs.append({
+            "stem": stem, "company": row["company"], "isin": row.get("isin", ""),
+            "url": row["link"], "dest": pdf_path,
+            "mirror": mirrors.get(mirror_key(row["link"])),
+            "task": {
+                "pdf_path": pdf_path, "stem": stem,
+                "start": None if args.full_pages else _as_int(row.get("start PDF")),
+                "end": None if args.full_pages else _as_int(row.get("end PDF")),
+                "tables": not args.no_tables, "all_tables": args.all_tables,
+                "discard_pdf": args.discard_pdfs,
+                "text_dir": TEXT_DIR, "table_dir": TABLE_DIR,
+            },
+        })
+    if cached:
+        log.info("%d document(s) already parsed, reusing", len(cached))
+
     if args.skip_download:
         downloads = {j["stem"]: (("skipped", os.path.getsize(j["dest"]))
                                  if _valid_pdf_on_disk(j["dest"])
                                  else ("error:missing", 0)) for j in jobs}
         log.info("Skipping downloads; %d PDFs already on disk",
                  sum(1 for s, _ in downloads.values() if s == "skipped"))
+        extractions = extract_all([j["task"] for j in jobs
+                                   if _usable(downloads[j["stem"]][0])],
+                                  args.extract_workers)
     else:
-        downloads = download_all(jobs, args.workers, args.refresh, args.host_delay)
-
-    # 3. extract
-    log.info("=" * 60)
-    log.info("STEP 3: Extracting text%s (%d processes)",
-             "" if args.no_tables else " and tables", args.extract_workers)
-    log.info("=" * 60)
-    tasks, cached = [], {}
-    for _, row in df.iterrows():
-        stem = row["_stem"]
-        if not _usable(downloads.get(stem, ("", 0))[0]):
-            continue
-        pdf_path = os.path.join(PDF_DIR, f"{stem}.pdf")
-        if not os.path.exists(pdf_path):
-            continue
-        text_path = os.path.join(TEXT_DIR, f"{stem}.txt")
-        if not args.re_extract and os.path.exists(text_path) \
-                and os.path.getmtime(text_path) >= os.path.getmtime(pdf_path):
-            table_path = os.path.join(TABLE_DIR, f"{stem}_tables.json")
-            body = open(text_path, encoding="utf-8").read()
-            n_tables = 0
-            if os.path.exists(table_path):
-                with open(table_path, encoding="utf-8") as f:
-                    n_tables = len(json.load(f))
-            cached[stem] = {
-                "stem": stem, "extraction_status": "success", "error": "",
-                "language": detect_language(body),
-                "pages_extracted": body.count("[[page:"),
-                "pdf_pages": 0,
-                "word_count": len(re.sub(r"\[\[page:\d+\]\]", " ", body).split()),
-                "tables_found": n_tables, "text_file": text_path,
-                "table_file": table_path if n_tables else None,
-            }
-            continue
-        tasks.append({
-            "pdf_path": pdf_path, "stem": stem,
-            "start": None if args.full_pages else _as_int(row.get("start PDF")),
-            "end": None if args.full_pages else _as_int(row.get("end PDF")),
-            "tables": not args.no_tables, "all_tables": args.all_tables,
-            "text_dir": TEXT_DIR, "table_dir": TABLE_DIR,
-        })
-    if cached:
-        log.info("%d document(s) already parsed, reusing", len(cached))
-    extractions = extract_all(tasks, args.extract_workers)
+        downloads, extractions = run_pipeline(jobs, args.workers, args.extract_workers,
+                                              args.refresh, args.host_delay,
+                                              args.max_pending)
+    for stem in cached:
+        downloads.setdefault(stem, ("skipped", 0))
     extractions.update(cached)
 
-    # 4. summary
+    # 3. summary
     log.info("=" * 60)
-    log.info("STEP 4: Summary")
+    log.info("STEP 3: Summary")
     log.info("=" * 60)
     summary = build_summary(df, downloads, extractions)
     report_totals(summary)

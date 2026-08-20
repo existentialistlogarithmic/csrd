@@ -77,12 +77,27 @@ log = logging.getLogger(__name__)
 
 # --- text prep --------------------------------------------------------------
 
-def split_sentences(text, min_len=30, cap=400):
+# Every model here has a 512-token window. A report's text is not all prose:
+# a table dumped by the PDF parser arrives as one run with no full stop, and
+# splitting on [.!?] then yields a 9,600-character "sentence" that overflows
+# the position embeddings. Cap it — 800 characters is ~200 tokens, comfortably
+# inside the window and longer than any real sentence.
+MAX_SENTENCE_CHARS = 800
+
+
+def split_sentences(text, min_len=30, cap=400, max_chars=MAX_SENTENCE_CHARS):
     """Sentences from the report, page markers stripped, short fragments dropped.
     cap>0 evenly subsamples to keep runtime bounded while covering the whole doc."""
     text = re.sub(r"\[\[page:\d+\]\]", " ", text)
     text = re.sub(r"\s+", " ", text)
-    sents = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if len(s.strip()) >= min_len]
+    sents = []
+    for raw in re.split(r"(?<=[.!?])\s+", text):
+        raw = raw.strip()
+        if len(raw) < min_len:
+            continue
+        # keep the head of an over-long run rather than dropping it: for a
+        # table dump that is the header row, which is the informative part
+        sents.append(raw[:max_chars] if len(raw) > max_chars else raw)
     if cap and len(sents) > cap:
         step = len(sents) / cap
         sents = [sents[int(i * step)] for i in range(cap)]
@@ -119,11 +134,30 @@ def semantic_scores(st_model, sentences, topk=15):
 
 # --- 2. FinBERT-ESG classification -----------------------------------------
 
+def _classify(pipe, sentences, batch_size=32):
+    """Run a text-classification pipeline, results in the input order.
+
+    Sentences are fed longest-first: a batch is padded to its longest member,
+    so mixing a 10-word sentence with a 200-word one makes the short one cost
+    as much as the long one. Grouping similar lengths together removes most of
+    that wasted compute for free.
+    """
+    if not sentences:
+        return []
+    order = sorted(range(len(sentences)), key=lambda i: -len(sentences[i]))
+    ordered = [sentences[i] for i in order]
+    results = list(pipe(ordered, batch_size=batch_size))
+    out = [None] * len(sentences)
+    for slot, result in zip(order, results):
+        out[slot] = result
+    return out
+
+
 def finbert_shares(pipe, sentences):
     from collections import Counter
     c = Counter()
     if sentences:
-        for r in pipe(sentences, batch_size=32, truncation=True):
+        for r in _classify(pipe, sentences):
             lab = str(r["label"]).lower()
             if "environ" in lab:
                 c["environmental"] += 1
@@ -149,11 +183,11 @@ def _is_positive(label):
 
 def climate_signals(detector, committer, sentences):
     n = len(sentences) or 1
-    climate = [s for s, r in zip(sentences, detector(sentences, batch_size=32, truncation=True))
+    climate = [s for s, r in zip(sentences, _classify(detector, sentences))
                if _is_positive(r["label"])] if sentences else []
     commitments = 0
     if climate:
-        commitments = sum(1 for r in committer(climate, batch_size=32, truncation=True)
+        commitments = sum(1 for r in _classify(committer, climate)
                           if _is_positive(r["label"]))
     cs = len(climate)
     commit_rate = round(commitments / cs, 4) if cs else 0.0
@@ -204,6 +238,23 @@ def pick_device(pref):
         return "cpu"
 
 
+def _quantize(model, name):
+    """Dynamic int8 on the linear layers — the standard CPU inference win.
+
+    These are classification heads over frozen encoders, so the quantisation
+    error lands well below the decision boundary; what it buys is roughly a
+    2x speedup and a quarter of the memory, which is what makes scoring a
+    2,000-report corpus on a CPU a couple of hours instead of a couple of days.
+    """
+    try:
+        import torch
+        return torch.ao.quantization.quantize_dynamic(
+            model.eval(), {torch.nn.Linear}, dtype=torch.qint8)
+    except Exception as e:  # noqa: BLE001 — speed is optional, correctness is not
+        log.warning("int8 quantisation unavailable for %s (%s); running fp32", name, e)
+        return model
+
+
 def load_models(args):
     device = pick_device(args.device)
     log.info("Loading models on device=%s ...", device)
@@ -212,20 +263,36 @@ def load_models(args):
     except ImportError:
         log.error("Hugging Face stack missing. Install it: pip install -r requirements-hf.txt")
         raise SystemExit(1)
-    models = {"st": SentenceTransformer(args.st_model, device=device)}
+    st = SentenceTransformer(args.st_model, device=device)
+    st.max_seq_length = min(getattr(st, "max_seq_length", 256) or 256, 256)
+    models = {"st": st}
     dev_idx = 0 if device == "cuda" else -1
+    quantize = device == "cpu" and not args.no_quantize
 
     if not args.no_finbert or not args.no_climatebert:
         from transformers import pipeline
+
+    def build(name, model_id):
+        """A text-classification pipeline with truncation pinned at the
+        tokenizer, not passed per call — transformers 5 ignores the call kwarg
+        and a single over-long input then blows up the whole report."""
+        pipe = pipeline("text-classification", model=model_id, device=dev_idx,
+                        truncation=True, max_length=512)
+        pipe.tokenizer.model_max_length = 512
+        pipe.tokenizer.truncation_side = "right"
+        if quantize:
+            pipe.model = _quantize(pipe.model, name)
+        return pipe
+
     if not args.no_finbert:
         try:
-            models["finbert"] = pipeline("text-classification", model=FINBERT_MODEL, device=dev_idx, truncation=True)
+            models["finbert"] = build("FinBERT-ESG", FINBERT_MODEL)
         except Exception as e:  # noqa: BLE001 — degrade gracefully
             log.warning("FinBERT-ESG unavailable (%s); skipping ESG classification", e)
     if not args.no_climatebert:
         try:
-            models["climate_detector"] = pipeline("text-classification", model=CLIMATE_DETECTOR, device=dev_idx, truncation=True)
-            models["climate_committer"] = pipeline("text-classification", model=CLIMATE_COMMITMENT, device=dev_idx, truncation=True)
+            models["climate_detector"] = build("ClimateBERT-detector", CLIMATE_DETECTOR)
+            models["climate_committer"] = build("ClimateBERT-commitment", CLIMATE_COMMITMENT)
         except Exception as e:  # noqa: BLE001
             log.warning("ClimateBERT unavailable (%s); skipping greenwashing signal", e)
     return models
@@ -244,6 +311,8 @@ def main():
     parser.add_argument("--device", help="cuda|cpu (auto-detected if omitted)")
     parser.add_argument("--no-finbert", action="store_true", help="Skip FinBERT-ESG classification")
     parser.add_argument("--no-climatebert", action="store_true", help="Skip ClimateBERT greenwashing signal")
+    parser.add_argument("--no-quantize", action="store_true",
+                        help="Skip int8 quantisation of the classifiers (CPU only; ~2x slower)")
     parser.add_argument("--limit", type=int)
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
