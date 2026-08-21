@@ -60,10 +60,17 @@ TOP_K = 4                 # passages considered per DR
 # retriever and a poor judge. So the floor is set only low enough to skip the
 # NLI pass on hopeless DRs, and entailment makes the actual call.
 SIM_FLOOR = 0.45
+QA_SIM_FLOOR = 0.30       # looser: a numeric sentence rarely echoes the DR title
 ENTAIL_REPORTED = 0.55    # entailment needed to call a DR "reported"
+STRONG_SIM = 0.62         # ... or retrieval this strong, which NLI often misses
+                          # on table-shaped text (a GHG inventory is not prose)
 QA_MIN_SCORE = 0.35       # below this the span is a guess, not an answer
+QA_NULL_THRESHOLD = -2.0  # logit margin a span must beat "no answer" by. Swept
+                          # over 0/-2/-4/-6 on five reports: recall plateaus at
+                          # -2, so anything looser only risks precision.
 MATERIAL_MIN_DRS = 2      # DRs a topical standard must actually report to count
 MAX_DRS_PER_SENTENCE = 3  # one sentence answering more than this is boilerplate
+MAX_ANSWER_TOKENS = 24    # a measurement is a few tokens, not a paragraph
 MAX_SENTENCE_CHARS = 800  # every model here has a 512-token window
 
 logging.basicConfig(
@@ -269,20 +276,50 @@ class Models:
 
     # -- extraction
     def answer(self, question, context):
-        """Best extractive span for a question, with its confidence."""
+        """Best extractive span for a question, with its confidence.
+
+        SQuAD2 models signal "this context has no answer" by pointing at the
+        CLS token, so a naive argmax returns '<s>' with a confidence of 1.00 —
+        which is how the first version of this produced 4 800 junk spans. The
+        search is therefore restricted to context tokens and the winner has to
+        beat the null score to be believed at all.
+        """
         if self.qa is None:
             return None, 0.0
         enc = self.qa_tok(question, context, return_tensors="pt",
                           truncation="only_second", max_length=384)
         with self.torch.no_grad():
             out = self.qa(**enc)
-        start = self.torch.softmax(out.start_logits[0], -1)
-        end = self.torch.softmax(out.end_logits[0], -1)
-        i, j = int(start.argmax()), int(end.argmax())
-        if j < i or j - i > 30:
+        start, end = out.start_logits[0], out.end_logits[0]
+
+        seq_ids = enc.sequence_ids(0)
+        ctx = [i for i, sid in enumerate(seq_ids) if sid == 1]
+        if not ctx:
             return None, 0.0
-        span = self.qa_tok.decode(enc["input_ids"][0][i:j + 1]).strip()
-        return (span or None), float((start[i] * end[j]) ** 0.5)
+
+        lo, hi = ctx[0], ctx[-1]
+        window = start[lo:hi + 1].unsqueeze(1) + end[lo:hi + 1].unsqueeze(0)
+        # spans must run forwards and stay short enough to be a measurement
+        mask = self.torch.ones_like(window, dtype=self.torch.bool).triu().tril(
+            MAX_ANSWER_TOKENS)
+        window = window.masked_fill(~mask, float("-inf"))
+        best = float(window.max())
+
+        # SQuAD2 scores "no answer" as the CLS span; the accepted convention is
+        # to compare it against the best real span in *logit* space, with a
+        # threshold. Softmax probabilities are not comparable across contexts
+        # of different lengths, which is what made the first attempt reject
+        # everything.
+        null = float(start[0] + end[0])
+        if best - null < QA_NULL_THRESHOLD:
+            return None, 0.0
+
+        flat = int(window.argmax())
+        i, j = lo + flat // window.shape[1], lo + flat % window.shape[1]
+        span = self.qa_tok.decode(enc["input_ids"][0][i:j + 1],
+                                  skip_special_tokens=True).strip()
+        confidence = 1.0 / (1.0 + pow(2.718281828, -(best - null) / 2))
+        return (span or None), confidence
 
 
 # --- per-report extraction ----------------------------------------------------
@@ -309,7 +346,8 @@ def _parse_value(span):
     return (int(value) if value.is_integer() else value), (match.group("unit") or None)
 
 
-def extract_report(text, models, taxonomy, dr_embeddings, use_qa=True):
+def extract_report(text, models, taxonomy, dr_embeddings,
+                   question_embeddings=None, qa_index=None, use_qa=True):
     """One report -> the phase-3 JSON schema, using retrieval + NLI + QA."""
     pairs = sentences_with_pages(text)
     # the content index is a map of where disclosures live, not a disclosure;
@@ -321,7 +359,13 @@ def extract_report(text, models, taxonomy, dr_embeddings, use_qa=True):
     sentences = [s for s, _ in pairs]
     pages = [p for _, p in pairs]
 
-    sims = models.embed(sentences) @ dr_embeddings.T        # [n_sent, n_dr]
+    sent_emb = models.embed(sentences)
+    sims = sent_emb @ dr_embeddings.T                       # [n_sent, n_dr]
+    # A DR title is about a policy, so title-similarity retrieves prose. The
+    # number lives in a different sentence, so datapoint extraction gets its
+    # own retrieval: the QA question, over sentences that contain a digit.
+    numeric = [i for i, s_ in enumerate(sentences) if _HAS_DIGIT_RE.search(s_)]
+    q_sims = (sent_emb[numeric] @ question_embeddings.T) if numeric else None
 
     # 1. shortlist passages per DR, and skip the NLI pass entirely for DRs with
     #    nothing that even looks relevant — that is most of them, and it is
@@ -389,7 +433,8 @@ def extract_report(text, models, taxonomy, dr_embeddings, use_qa=True):
             evidence = [{"quote": quote[:300], "page": pages[i]}]
 
         mandatory = dr["standard"] == "ESRS2" or code in ESRS2_CODES
-        if entail >= ENTAIL_REPORTED:
+        top_sim_now = hits[0][1] if hits else 0.0
+        if entail >= ENTAIL_REPORTED or top_sim_now >= STRONG_SIM:
             status = "reported"
         elif quote and _PHASE_IN_RE.search(quote):
             status = "phase_in_deferred"
@@ -404,9 +449,12 @@ def extract_report(text, models, taxonomy, dr_embeddings, use_qa=True):
         confidence = round(min(1.0, 0.45 * top_sim / 0.6 + 0.55 * entail), 3)
 
         datapoints, flags = [], []
-        if use_qa and status == "reported" and _is_quantitative(dr):
-            context = " ".join(sentences[i] for i, _ in hits[:TOP_K])
+        if use_qa and _is_quantitative(dr) and status in (
+                "reported", "material_not_reported"):
             question = QA_QUESTIONS.get(code) or f"What is the reported {dr['dr_title']}?"
+            context = _numeric_context(sentences, numeric, q_sims, qa_index.get(code))
+            if not context:                           # no figures anywhere near it
+                context = " ".join(sentences[i] for i, _ in hits[:TOP_K])
             span, qa_score = models.answer(question, context)
             value, unit = _parse_value(span)
             if not _plausible_datapoint(value, unit, span):
@@ -414,6 +462,11 @@ def extract_report(text, models, taxonomy, dr_embeddings, use_qa=True):
                 if span:
                     flags.append("value_rejected_implausible")
             if value is not None and qa_score >= QA_MIN_SCORE:
+                # a figure retrieved for this DR is itself the disclosure, so it
+                # overrides an entailment model that could not read the table
+                if status == "material_not_reported":
+                    status = "reported"
+                    flags.append("status_from_datapoint")
                 datapoints.append({
                     "name": dr["dr_title"], "value": value, "unit": unit,
                     "scope_or_breakdown": None, "period": None,
@@ -462,9 +515,27 @@ def extract_report(text, models, taxonomy, dr_embeddings, use_qa=True):
     }
 
 
-_QUANT_WORDS = ("emission", "energy", "consumption", "water", "waste", "material",
-                "employee", "injuries", "pay gap", "incidents", "payment", "credits",
-                "pricing", "number", "characteristics", "diversity", "workforce")
+_HAS_DIGIT_RE = re.compile(r"\d")
+
+
+def _numeric_context(sentences, numeric, q_sims, col, k=TOP_K):
+    """Top numeric sentences for one DR's question, as a QA context."""
+    if col is None or q_sims is None or not len(numeric):
+        return ""
+    scores = q_sims[:, col]
+    order = np.argsort(scores)[::-1][:k]
+    picked = [numeric[i] for i in order if scores[i] >= QA_SIM_FLOOR]
+    return " ".join(sentences[i] for i in sorted(picked))
+
+
+# Words that mean "this DR carries a figure". Kept narrow on purpose: a loose
+# "material" matched "Material impacts, risks and opportunities" and sent the
+# QA model at a dozen narrative DRs, where it correctly answers "no answer".
+_QUANT_WORDS = ("emission", "energy consumption", "energy mix", "water consumption",
+                "water withdrawal", "waste", "materials used", "material inflow",
+                "material outflow", "injuries", "pay gap", "incidents",
+                "payment practices", "carbon credits", "carbon pricing",
+                "number of", "characteristics of", "diversity")
 _TARGET_WORDS = ("target", "tracking effectiveness")
 
 
@@ -490,9 +561,12 @@ def _plausible_datapoint(value, unit, span):
                           span or "", re.IGNORECASE))
 
 
+_QUANT_RE = re.compile(r"\b(?:" + "|".join(_QUANT_WORDS) + r")\b", re.IGNORECASE)
+
+
 def _is_quantitative(dr):
-    return dr["dr_code"] in QA_QUESTIONS or any(
-        w in dr["dr_title"].lower() for w in _QUANT_WORDS)
+    """Whole-word match only — "diversity" must not fire on "biodiversity"."""
+    return dr["dr_code"] in QA_QUESTIONS or bool(_QUANT_RE.search(dr["dr_title"]))
 
 
 def _is_target_dr(dr):
@@ -549,6 +623,13 @@ def main():
     models = Models(use_qa=not args.no_qa, quantize=not args.no_quantize,
                     threads=args.threads)
     dr_embeddings = models.embed([f"{d['dr_code']}: {d['dr_title']}" for d in taxonomy])
+    # one embedded question per quantitative DR, for the numeric retrieval pass
+    quant = [d for d in taxonomy if _is_quantitative(d)]
+    qa_index = {d["dr_code"]: i for i, d in enumerate(quant)}
+    question_embeddings = models.embed(
+        [QA_QUESTIONS.get(d["dr_code"]) or f"What is the reported {d['dr_title']}?"
+         for d in quant]) if quant else None
+    log.info("%d of %d DRs carry a quantitative question", len(quant), len(taxonomy))
     log.info("%d report(s) to extract", len(jobs))
 
     rows, failures = [], []
@@ -556,7 +637,8 @@ def main():
     for n, job in enumerate(jobs, 1):
         try:
             result = extract_report(read_text(job["text_path"]), models, taxonomy,
-                                    dr_embeddings, use_qa=not args.no_qa)
+                                    dr_embeddings, question_embeddings, qa_index,
+                                    use_qa=not args.no_qa)
         except Exception as e:                        # noqa: BLE001 - log and continue
             log.error("[%d/%d] %s failed: %s", n, len(jobs), job["stem"], e)
             failures.append({"stem": job["stem"], "error": str(e)})
