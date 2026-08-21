@@ -235,18 +235,34 @@ Two corrections that mattered more than any threshold:
 * **A sentence may serve at most three DRs.** Cross-reference boilerplate
   ("for further information, please refer to …") otherwise answers a dozen.
 
-**Validation.** Over a 70-report sample, coverage tracks SRN's independent,
-human-assigned `csrd_compliant` flag: reports marked *full* score 61.5 DRs
-reported against 48.5 for *partial* (Mann-Whitney one-sided, **p = 0.0092**).
-It is not simply measuring length — correlation with word count is r = 0.23.
+**Validation, over the full corpus (1,747 reports).** There is no labelled
+ground truth for ESRS coverage, so the check is against SRN's independent,
+human-assigned `csrd_compliant` flag. Reports marked *full* score **71.0** DRs
+reported against **56.4** for *partial* (n = 1,538 / 209), and are more than
+twice as likely to be complete on the mandatory ESRS 2 block (**32% vs 15%**).
+Correlation with word count is only **r = 0.23**, so it is reading content
+rather than rewarding long documents.
+
+**What the corpus says.** Average 69.3 DRs reported and 18.8 material-but-
+missing per report; ESRS 2 complete in 527 of 1,747 (30%). Coverage is flat
+between FY2024 and FY2025 (68.9 → 69.7). The most-missing DRs are a coherent
+set: internal carbon pricing (E1-8, 61%), non-employee workforce (S1-7, 57%),
+and — notably — every "anticipated financial effects" DR (E2-6, E4-6, E1-9,
+E3-5, all 40-57% missing), which are exactly the requirements carrying
+first-year phase-in relief. Near-universal: E1-6 gross GHG emissions (98.8%)
+and the climate policy/action/target chain E1-2/3/4 (96-98%).
 
 **What it cannot do**, against the LLM backend: it cannot reason about a
 disclosure it failed to retrieve, cannot normalise units it has not seen, and
 gives a status with a grounded quote rather than an argued judgement.
 Datapoint extraction is deliberately conservative — a span with no unit that
 looks like a year, a section number, or two numbers run together is rejected
-rather than reported — so expect few datapoints per report and trust the ones
-you get. Output goes to `esrs_neural_output/` and `esrs_neural_coverage.csv`,
+rather than reported — so expect few and trust the ones you get: **1.55 per
+report** over the corpus (2,712 total), mostly percentages, MWh, tonnes and
+tCO2e. Recall is the honest weak spot; precision is the thing it buys you.
+Phase-in detection is weak too — it is a regex over the evidence quote, so the
+deferral-heavy "anticipated financial effects" DRs land in
+`material_not_reported` rather than `phase_in_deferred`. Output goes to `esrs_neural_output/` and `esrs_neural_coverage.csv`,
 in the same schema as phase 3, so the two backends are directly comparable.
 
 ### Phase 3 — ESRS disclosure-requirement extraction
